@@ -43,16 +43,34 @@ export interface SnapshotFrame {
 
 export type Frame = InitFrame | SnapshotFrame;
 
+/** A side of a match: a built-in bot or a trained model (`GET /api/models`). */
+export type Agent = "scripted" | "random" | { policy: string };
+
+export interface ModelInfo {
+  id: string;
+  side: "human" | "zombie";
+  run_id: string;
+  iteration: number;
+  steps: number;
+  /** Env config file the model was trained on (`custom` if none matched). */
+  stage: string;
+  hidden: number;
+  obs_dim: number;
+  created_at: number;
+  config: Record<string, unknown>;
+}
+
 export interface MatchInfo {
   id: string;
-  human: string;
-  zombies: string;
+  human: Agent;
+  zombies: Agent;
+  deterministic: boolean;
   episode: number;
   tick: number;
   time: number;
   speed: number;
   paused: boolean;
-  status: "running" | "finished" | "stopped";
+  status: "running" | "finished" | "stopped" | "failed";
   outcome: string;
   replays: string[];
 }
@@ -64,6 +82,8 @@ export interface ReplaySummary {
   seed: number;
   human: string;
   zombies: string;
+  human_model?: string;
+  zombie_model?: string;
   outcome: string;
   length: number;
 }

@@ -1,6 +1,13 @@
 import { decode } from "@msgpack/msgpack";
 
-import type { Frame, MatchInfo, MetricPoint, ReplaySummary, RunSummary } from "./types";
+import type {
+  Frame,
+  MatchInfo,
+  MetricPoint,
+  ModelInfo,
+  ReplaySummary,
+  RunSummary,
+} from "./types";
 
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -12,6 +19,7 @@ async function json<T>(res: Response): Promise<T> {
 
 export const listMatches = () => fetch("/api/matches").then((r) => json<MatchInfo[]>(r));
 export const listReplays = () => fetch("/api/replays").then((r) => json<ReplaySummary[]>(r));
+export const listModels = () => fetch("/api/models").then((r) => json<ModelInfo[]>(r));
 export const listRuns = () => fetch("/api/runs").then((r) => json<RunSummary[]>(r));
 export const listMetrics = (runId: string) =>
   fetch(`/api/metrics?run_id=${encodeURIComponent(runId)}`).then((r) => json<MetricPoint[]>(r));

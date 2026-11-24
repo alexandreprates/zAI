@@ -9,7 +9,7 @@ unexport DOCKER_DEFAULT_PLATFORM
 DEV := docker compose run --rm -T dev
 GPU := docker compose -f compose.yaml -f compose.gpu.yaml
 
-.PHONY: test lint fmt shell build up train-human train-human-gpu tensorboard web-install web-dev check-gpu ci-test ci-lint ci-fmt ci-py-develop ci-web-install
+.PHONY: test lint fmt shell build up export-model export-model-gpu train-human train-human-gpu tensorboard web-install web-dev check-gpu ci-test ci-lint ci-fmt ci-py-develop ci-web-install
 
 test: ## Run Rust and Python tests
 	$(DEV) make ci-test
@@ -46,6 +46,12 @@ export-replays: ## Record a human checkpoint's episodes as viewer replays; ARGS=
 
 export-replays-gpu: ## On the GPU server: same as export-replays, reusing the CUDA trainer image (inference runs on CPU)
 	$(GPU) --profile train run --rm --build trainer python -m arena.export_replays $(ARGS)
+
+export-model: ## Export checkpoints as ONNX models for live viewer matches; ARGS="--checkpoint /checkpoints/<side>/<run>/latest.pt"
+	docker compose --profile train run --rm --build trainer python -m arena.export_model $(ARGS)
+
+export-model-gpu: ## On the GPU server: same as export-model, reusing the CUDA trainer image
+	$(GPU) --profile train run --rm --build trainer python -m arena.export_model $(ARGS)
 
 tensorboard: ## TensorBoard on http://localhost:6006 over the runs volume
 	docker compose --profile tensorboard up tensorboard

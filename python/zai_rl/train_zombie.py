@@ -26,6 +26,7 @@ import numpy as np
 import torch
 import yaml
 
+from arena.export_model import export_training_model
 from arena.export_replays import record_training_replays, training_replay_dir
 from arena.matches import MatchStats, play
 from zai_env.config import deep_merge, load_config
@@ -318,6 +319,8 @@ def main() -> None:
             }
             save_checkpoint(ckpt_dir / f"it{iteration:06d}.pt", algo, extra)
             save_checkpoint(ckpt_dir / "latest.pt", algo, extra)
+            # Live matches in the viewer play the latest exported model of each run.
+            export_training_model(algo.actor, run_id, env_cfg, iteration, steps)
 
     metrics.close()
     log.info("done: %d steps in %.0f s", steps, time.time() - started)

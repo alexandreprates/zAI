@@ -4,10 +4,12 @@ version = "0.1.0"
 description = "ZAI environment wrappers, trainers, remote agents and arena."
 requires-python = ">=3.12"
 # The `zai_sim` extension module is built from crates/zai-py with maturin.
-# PyTorch is installed separately by the trainer image (CPU or CUDA 12.6 index).
+# PyTorch is installed separately by the trainer image (CPU or CUDA 12.6 index); `onnx` is
+# needed by `torch.onnx.export` (arena.export_model).
 dependencies = [
     "gymnasium>=1.0",
     "numpy>=2.0",
+    "onnx>=1.17",
     "pettingzoo>=1.24",
     "pyyaml>=6.0",
 ]

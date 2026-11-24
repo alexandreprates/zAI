@@ -182,3 +182,71 @@ async fn metrics_matches_and_replays_end_to_end() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn trained_models_play_live_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let models = dir.path().join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    for name in ["human.onnx", "human.json", "zombie.onnx", "zombie.json"] {
+        std::fs::copy(fixtures.join(name), models.join(name)).unwrap();
+    }
+    let state = Arc::new(AppState::new(
+        Config::default(),
+        dir.path().join("replays"),
+        None,
+    ));
+    let router = app(state, None);
+
+    let (status, list) = call(&router, "GET", "/api/models", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let sides: Vec<_> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["side"].clone())
+        .collect();
+    assert_eq!(sides.len(), 2);
+    assert!(sides.contains(&json!("human")) && sides.contains(&json!("zombie")));
+
+    for bad in [json!({"policy": "missing"}), json!({"policy": "zombie"})] {
+        let (status, body) =
+            call(&router, "POST", "/api/matches", Some(json!({"human": bad}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    let (status, info) = call(
+        &router,
+        "POST",
+        "/api/matches",
+        Some(json!({
+            "config": {"episode_cap_s": 20.0, "zombie_count": 3},
+            "seed": 7,
+            "speed": 0,
+            "human": {"policy": "human"},
+            "zombies": {"policy": "zombie"},
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{info}");
+    assert_eq!(info["human"], json!({"policy": "human"}));
+    let id = info["id"].as_str().unwrap().to_owned();
+
+    let mut replay_id = None;
+    for _ in 0..200 {
+        let (_, m) = call(&router, "GET", &format!("/api/matches/{id}"), None).await;
+        assert_ne!(m["status"], "failed", "{m}");
+        if m["status"] == "finished" {
+            replay_id = m["replays"][0].as_str().map(str::to_owned);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let replay_id = replay_id.expect("the match finishes with a replay");
+    let (_, replay) = call(&router, "GET", &format!("/api/replays/{replay_id}"), None).await;
+    assert_eq!(replay["human"], "policy");
+    assert_eq!(replay["zombies"], "policy");
+    assert_eq!(replay["human_model"], "human");
+    assert_eq!(replay["zombie_model"], "zombie");
+}

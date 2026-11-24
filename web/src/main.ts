@@ -1,9 +1,17 @@
 import "./style.css";
 
-import { createMatch, listMatches, listReplays, listRuns, stopMatch, Stream } from "./api";
+import {
+  createMatch,
+  listMatches,
+  listModels,
+  listReplays,
+  listRuns,
+  stopMatch,
+  Stream,
+} from "./api";
 import { Charts } from "./charts";
 import { TopDown } from "./topdown";
-import type { Frame, InitFrame, ReplaySummary, SnapshotFrame } from "./types";
+import type { Agent, Frame, InitFrame, ModelInfo, ReplaySummary, SnapshotFrame } from "./types";
 
 const SPEEDS = [0.5, 1, 2, 4, 8, 16];
 
@@ -18,6 +26,74 @@ let seeking = false;
 /** Training run whose recorded episodes are shown above the stage/charts. */
 let currentRun: string | null = null;
 let replays: ReplaySummary[] = [];
+let models: ModelInfo[] = [];
+let lastModels = "";
+
+const agentName = (a: Agent) => (typeof a === "string" ? a : a.policy);
+const POLICY = "policy:";
+
+/** Adds the trained models of each side to the agent selects and their stages to the map
+ * select, keeping the current choices. */
+function renderModelOptions(): void {
+  const form = $<HTMLFormElement>("new-match");
+  for (const [name, side] of [
+    ["human", "human"],
+    ["zombies", "zombie"],
+  ] as const) {
+    const select = form.elements.namedItem(name) as HTMLSelectElement;
+    const current = select.value;
+    select.querySelector("optgroup")?.remove();
+    const own = models.filter((m) => m.side === side);
+    if (own.length > 0) {
+      const group = document.createElement("optgroup");
+      group.label = "trained";
+      for (const m of own) {
+        const o = new Option(`${m.id} · it ${m.iteration} · ${m.stage}`, POLICY + m.id);
+        group.appendChild(o);
+      }
+      select.appendChild(group);
+    }
+    select.value = [...select.options].some((o) => o.value === current) ? current : "scripted";
+  }
+  const stage = form.elements.namedItem("stage") as HTMLSelectElement;
+  const current = stage.value;
+  stage.replaceChildren(new Option("server default", ""));
+  for (const s of [...new Set(models.map((m) => m.stage))].sort()) {
+    stage.appendChild(new Option(s, s));
+  }
+  stage.value = [...stage.options].some((o) => o.value === current) ? current : "";
+  updateFormNote();
+}
+
+function selectedModel(name: "human" | "zombies"): ModelInfo | undefined {
+  const form = $<HTMLFormElement>("new-match");
+  const v = (form.elements.namedItem(name) as HTMLSelectElement).value;
+  return v.startsWith(POLICY) ? models.find((m) => m.id === v.slice(POLICY.length)) : undefined;
+}
+
+/** Warns when a trained model plays on a map other than the one it was trained on. */
+function updateFormNote(): void {
+  const form = $<HTMLFormElement>("new-match");
+  const stage = (form.elements.namedItem("stage") as HTMLSelectElement).value;
+  const off = [selectedModel("human"), selectedModel("zombies")].filter(
+    (m): m is ModelInfo => m !== undefined && m.stage !== stage,
+  );
+  const note = $("form-note");
+  note.hidden = off.length === 0;
+  note.textContent = off.map((m) => `${m.id} was trained on ${m.stage}`).join("; ");
+}
+
+/** Picking a trained model switches the map to its training stage (zombies take priority). */
+function onAgentChange(): void {
+  const form = $<HTMLFormElement>("new-match");
+  const m = selectedModel("zombies") ?? selectedModel("human");
+  if (m) (form.elements.namedItem("stage") as HTMLSelectElement).value = m.stage;
+  updateFormNote();
+}
+
+function agentValue(v: string): Agent {
+  return v.startsWith(POLICY) ? { policy: v.slice(POLICY.length) } : (v as Agent);
+}
 
 function formatTime(s: number): string {
   const m = Math.floor(s / 60);
@@ -117,7 +193,7 @@ function renderRunReplays(): void {
     b.className = `chip ${r.outcome}`;
     b.classList.toggle("active", selected === key);
     b.textContent = `it ${r.episode} · #${k} · ${r.outcome}`;
-    b.title = `${r.id}: ${r.human} human vs ${r.zombies} zombies, ${r.length} decisions`;
+    b.title = `${r.id}: ${r.human_model ?? r.human} human vs ${r.zombie_model ?? r.zombies} zombies, ${r.length} decisions`;
     b.onclick = () => watch(`/ws/replay/${r.id}`, key, run);
     return b;
   });
@@ -148,11 +224,18 @@ function item(title: string, detail: string, key: string, onOpen: () => void): H
 
 async function refreshLists(): Promise<void> {
   try {
-    const [matches, allReplays, runs] = await Promise.all([
+    const [matches, allReplays, runs, allModels] = await Promise.all([
       listMatches(),
       listReplays(),
       listRuns(),
+      listModels(),
     ]);
+    const modelSignature = JSON.stringify(allModels.map((m) => [m.id, m.created_at]));
+    if (modelSignature !== lastModels) {
+      lastModels = modelSignature;
+      models = allModels;
+      renderModelOptions();
+    }
     // Re-render only on change, so clicks are not lost to a DOM swap.
     const signature = JSON.stringify([matches, allReplays, runs, selected, currentRun]);
     if (signature === lastLists) return;
@@ -168,7 +251,8 @@ async function refreshLists(): Promise<void> {
     $("matches").replaceChildren(
       ...matches.map((m) => {
         const key = `m:${m.id}`;
-        const li = item(m.id, `${m.status} · ep ${m.episode} · ${m.outcome}`, key, () =>
+        const vs = `${agentName(m.human)} vs ${agentName(m.zombies)}`;
+        const li = item(m.id, `${m.status} · ep ${m.episode} · ${m.outcome} · ${vs}`, key, () =>
           watch(`/ws/match/${m.id}`, key),
         );
         if (m.status === "running") {
@@ -184,7 +268,8 @@ async function refreshLists(): Promise<void> {
     $("replays").replaceChildren(
       ...allReplays.filter((r) => !runIds.has(r.match_id)).map((r) => {
         const key = `r:${r.id}`;
-        return item(r.id, `${r.outcome} · ${r.length} ticks · ${r.human}/${r.zombies}`, key, () =>
+        const vs = `${r.human_model ?? r.human}/${r.zombie_model ?? r.zombies}`;
+        return item(r.id, `${r.outcome} · ${r.length} ticks · ${vs}`, key, () =>
           watch(`/ws/replay/${r.id}`, key),
         );
       }),
@@ -232,10 +317,17 @@ function setupControls(): void {
   };
 
   const form = $<HTMLFormElement>("new-match");
+  for (const name of ["human", "zombies"]) {
+    (form.elements.namedItem(name) as HTMLSelectElement).onchange = onAgentChange;
+  }
+  (form.elements.namedItem("stage") as HTMLSelectElement).onchange = updateFormNote;
   form.onsubmit = async (ev) => {
     ev.preventDefault();
     const data = new FormData(form);
-    const config: Record<string, number> = {};
+    // A stage is the full env config of a training run; count fields override it.
+    const stage = String(data.get("stage") ?? "");
+    const base = models.find((m) => m.stage === stage && stage !== "")?.config ?? {};
+    const config: Record<string, unknown> = { ...base };
     for (const key of ["zombie_count", "food_count"]) {
       const v = String(data.get(key) ?? "");
       if (v !== "") config[key] = Number(v);
@@ -244,8 +336,9 @@ function setupControls(): void {
     try {
       $("form-error").textContent = "";
       const m = await createMatch({
-        human: data.get("human"),
-        zombies: data.get("zombies"),
+        human: agentValue(String(data.get("human"))),
+        zombies: agentValue(String(data.get("zombies"))),
+        deterministic: data.get("deterministic") === "on",
         auto_restart: data.get("auto_restart") === "on",
         config,
         ...(seed !== "" ? { seed: Number(seed) } : {}),

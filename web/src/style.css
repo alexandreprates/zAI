@@ -105,6 +105,16 @@ button.small {
   font-size: 11px;
 }
 
+.note {
+  color: #f5c451;
+  margin: 0;
+  font-size: 12px;
+}
+
+.note[hidden] {
+  display: none;
+}
+
 .error {
   color: var(--danger);
   margin: 0;

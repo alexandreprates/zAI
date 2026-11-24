@@ -65,8 +65,20 @@ server, http://localhost:6006.
 
 ## 5. Watch the trained policy play
 
-Live matches only run the scripted bots, but a checkpoint's episodes can be recorded as
-replays (CPU inference, a few seconds per episode) and watched under "Replays" in the viewer:
+Trainers export the latest model of each run to ONNX on every checkpoint
+(`<data volume>/models/<run_id>.onnx` + `.json`). The viewer lists those models under
+"trained" in the Human / Zombies selects of "New match"; the server runs them live on the CPU
+with `tract` (`crates/zai-server/src/policy.rs`). Picking a model switches "Map" to the env
+config it was trained on (a warning shows when a model plays on another map), and
+"Deterministic policies" takes the most likely action instead of sampling. Checkpoints from
+before the automatic export are exported by hand:
+
+```bash
+make export-model-gpu ARGS="--checkpoint /checkpoints/human/human-s0-gpu1/latest.pt /checkpoints/zombie/zombie-s0small-gpu1/latest.pt"
+```
+
+A checkpoint's episodes can also be recorded offline as replays (CPU inference, a few seconds
+per episode) and watched under "Replays" in the viewer:
 
 ```bash
 docker compose up -d --build server

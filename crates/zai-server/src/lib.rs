@@ -4,6 +4,7 @@ pub mod api;
 pub mod frames;
 pub mod matches;
 pub mod metrics;
+pub mod policy;
 pub mod replay;
 pub mod ws;
 
@@ -21,12 +22,15 @@ use zai_sim::Config;
 
 use crate::matches::MatchHandle;
 use crate::metrics::MetricsStore;
+use crate::policy::ModelStore;
 use crate::replay::ReplayStore;
 
 pub struct AppState {
     pub base_config: Config,
     pub matches: RwLock<HashMap<String, MatchHandle>>,
     pub replays: ReplayStore,
+    /// Trained models, in `models/` next to the replay directory.
+    pub models: ModelStore,
     pub metrics: MetricsStore,
     pub metrics_tx: broadcast::Sender<String>,
     next_id: AtomicU64,
@@ -34,7 +38,9 @@ pub struct AppState {
 
 impl AppState {
     /// `data_dir` holds `replays/` and `metrics.db`; `None` keeps metrics in memory (tests).
+    /// Models are read from the `models` directory next to `replays_dir`.
     pub fn new(base_config: Config, replays_dir: PathBuf, metrics_db: Option<PathBuf>) -> Self {
+        let models = ModelStore::new(replays_dir.with_file_name("models"));
         let replays = ReplayStore::new(replays_dir).expect("replay directory is writable");
         let metrics = MetricsStore::open(metrics_db.as_deref()).expect("metrics database opens");
         let (metrics_tx, _) = broadcast::channel(1024);
@@ -42,6 +48,7 @@ impl AppState {
             base_config,
             matches: RwLock::new(HashMap::new()),
             replays,
+            models,
             metrics,
             metrics_tx,
             next_id: AtomicU64::new(1),
@@ -107,6 +114,7 @@ pub fn app(state: Arc<AppState>, web_dir: Option<PathBuf>) -> Router {
         )
         .route("/api/matches/{id}", get(api::get_match))
         .route("/api/matches/{id}/control", post(api::control_match))
+        .route("/api/models", get(api::list_models))
         .route("/api/replays", get(api::list_replays))
         .route("/api/replays/{id}", get(api::get_replay))
         .route(

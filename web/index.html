@@ -25,6 +25,13 @@
                 <option value="random">random</option>
               </select>
             </label>
+            <label>Map
+              <select name="stage">
+                <option value="">server default</option>
+              </select>
+            </label>
+            <p id="form-note" class="note" hidden></p>
+            <label class="check"><input name="deterministic" type="checkbox" /> Deterministic policies</label>
             <label>Zombie count <input name="zombie_count" type="number" min="1" max="64" placeholder="default" /></label>
             <label>Food count <input name="food_count" type="number" min="0" max="128" placeholder="default" /></label>
             <label>Seed <input name="seed" type="number" min="0" placeholder="random" /></label>

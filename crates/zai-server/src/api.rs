@@ -14,8 +14,9 @@ use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
-use crate::matches::{self, Control, MatchRequest};
+use crate::matches::{self, Control, MatchModels, MatchRequest};
 use crate::metrics::MetricsPost;
+use crate::policy::Side;
 use crate::{merge_config, unix_now, AppState};
 
 fn error(status: StatusCode, msg: impl Into<String>) -> Response {
@@ -46,6 +47,26 @@ pub async fn create_match(
         Ok(cfg) => cfg,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
     };
+    let store = state.models.clone();
+    let (human, zombies, zombie_count) = (req.human.clone(), req.zombies.clone(), cfg.zombie_count);
+    let loaded = tokio::task::spawn_blocking(move || -> Result<MatchModels, String> {
+        Ok(MatchModels {
+            human: human
+                .model_id()
+                .map(|id| store.load(id, Side::Human, 1))
+                .transpose()?,
+            zombies: zombies
+                .model_id()
+                .map(|id| store.load(id, Side::Zombie, zombie_count))
+                .transpose()?,
+        })
+    })
+    .await;
+    let models = match loaded {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => return error(StatusCode::BAD_REQUEST, e),
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
     let id = state.next_match_id();
     let seed = req.seed.unwrap_or_else(crate::random_seed);
     let handle = matches::start(
@@ -55,6 +76,7 @@ pub async fn create_match(
         seed,
         unix_now(),
         state.replays.clone(),
+        models,
     );
     let info = handle.info.lock().expect("match info lock").clone();
     state
@@ -102,6 +124,15 @@ pub async fn control_match(
         h.control(Control::Stop);
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Trained models available for matches (`policy.rs`), newest first.
+pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
+    let store = state.models.clone();
+    match tokio::task::spawn_blocking(move || store.list()).await {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 pub async fn list_replays(State(state): State<Arc<AppState>>) -> Response {
