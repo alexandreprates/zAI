@@ -316,4 +316,5 @@ button[hidden] {
 .chip.active {
   border-color: var(--accent);
   background: #4ea8ff26;
+  color: var(--text);
 }
