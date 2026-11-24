@@ -475,8 +475,81 @@ fn shaping_is_zero_by_default_and_potential_based_when_enabled() {
     env.human.pos = Vec2::new(200.0, 200.0);
     env.zombies[0].pos = Vec2::new(250.0, 200.0);
     let r = env.step(IDLE, &[8]); // west, toward the human
+    assert_eq!(r.zombie_reward, -0.002, "the team part has no shaping");
     assert!(
-        r.zombie_reward > -0.002,
+        env.zombie_rewards()[0] > -0.002,
         "approaching the human is rewarded"
     );
+}
+
+fn shaped(zombies: usize) -> Env {
+    let mut cfg = open_field(zombies);
+    cfg.reward.zombie_distance_shaping = 0.5;
+    let mut env = make_env(cfg);
+    env.human.pos = Vec2::new(200.0, 200.0);
+    env
+}
+
+fn close(a: f32, b: f32) -> bool {
+    (a - b).abs() < 1e-5
+}
+
+#[test]
+fn zombie_distance_potential_is_per_agent_and_saturates_at_the_range() {
+    let mut env = shaped(3);
+    env.zombies[0].pos = Vec2::new(220.0, 200.0); // 20 m: Phi = 0.5 * 0.8 = 0.4
+    env.zombies[1].pos = Vec2::new(260.0, 200.0); // 60 m: Phi = 0.2
+    env.zombies[2].pos = Vec2::new(200.0, 340.0); // 140 m: beyond the range, Phi = 0
+    env.step(IDLE, &stay(&env));
+    let g = env.cfg.reward.gamma;
+    let r = env.zombie_rewards();
+    assert!(close(r[0], -0.002 + (g - 1.0) * 0.4), "{r:?}");
+    assert!(close(r[1], -0.002 + (g - 1.0) * 0.2), "{r:?}");
+    assert!(close(r[2], -0.002), "{r:?}");
+}
+
+#[test]
+fn team_min_shaping_shares_the_nearest_zombie_potential() {
+    let mut env = shaped(2);
+    env.cfg.reward.zombie_distance_shaping_mode = crate::ZombieShapingMode::TeamMin;
+    env.zombies[0].pos = Vec2::new(220.0, 200.0);
+    env.zombies[1].pos = Vec2::new(260.0, 200.0);
+    env.step(IDLE, &stay(&env));
+    let g = env.cfg.reward.gamma;
+    for &r in env.zombie_rewards() {
+        assert!(close(r, -0.002 + (g - 1.0) * 0.4), "{r}");
+    }
+}
+
+#[test]
+fn starvation_pays_zombies_nothing_beyond_the_lost_potential() {
+    let mut env = shaped(1);
+    env.zombies[0].pos = Vec2::new(250.0, 200.0); // 50 m: Phi = 0.25
+    env.human.hunger_s = 0.25;
+    let r = env.step(IDLE, &stay(&env));
+    assert_eq!(r.outcome, Outcome::Starved);
+    assert!(close(env.zombie_rewards()[0], -0.002 - 0.25));
+}
+
+#[test]
+fn a_catch_pays_the_catch_reward_plus_the_maximum_potential() {
+    let mut env = shaped(1);
+    env.zombies[0].pos = Vec2::new(200.8, 200.0); // Phi = 0.5 * (1 - 0.8 / 100)
+    let r = env.step(human(EAST, INTERACT_NONE), &stay(&env));
+    assert_eq!(r.outcome, Outcome::Caught);
+    let g = env.cfg.reward.gamma;
+    let expected = -0.002 + 1.0 + g * 0.5 - 0.5 * (1.0 - 0.8 / 100.0);
+    assert!(
+        close(env.zombie_rewards()[0], expected),
+        "{:?}",
+        env.zombie_rewards()
+    );
+}
+
+#[test]
+fn zombie_rewards_equal_the_team_reward_without_shaping() {
+    let mut env = make_env(open_field(3));
+    env.human.pos = Vec2::new(200.0, 200.0);
+    let r = env.step(IDLE, &stay(&env));
+    assert_eq!(env.zombie_rewards(), &[r.zombie_reward; 3]);
 }

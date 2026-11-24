@@ -58,7 +58,8 @@ class ZaiParallelEnv(ParallelEnv):
         zombies = [int(actions.get(a, zai_sim.MOVE_ACTIONS - 1)) for a in self.agents[1:]]
         hr, zr, term, trunc, outcome = self._env.step(int(h[0]), int(h[1]), zombies)
         obs = self._observations()
-        rewards = {a: float(hr) if a == "human" else float(zr) for a in self.agents}
+        rewards = {"human": float(hr)}
+        rewards.update({a: float(r) for a, r in zip(self.agents[1:], zr, strict=True)})
         terminations = {a: bool(term) for a in self.agents}
         truncations = {a: bool(trunc) for a in self.agents}
         infos = self._infos(outcome)

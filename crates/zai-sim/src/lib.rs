@@ -13,7 +13,7 @@ pub mod obs;
 #[cfg(test)]
 mod tests;
 
-pub use config::{Config, ConfigError};
+pub use config::{Config, ConfigError, ZombieShapingMode};
 pub use env::{Env, HumanAction, NoiseKind, Outcome, StepResult};
 pub use obs::{HUMAN_OBS_DIM, STATE_DIM, ZOMBIE_OBS_DIM};
 

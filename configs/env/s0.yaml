@@ -11,4 +11,8 @@ min_spawn_distance_m: 50.0
 reward:
   # Potential-based food shaping (reserve + proximity, see Env::human_potential).
   human_food_shaping: 1.0
+  # Per-zombie distance potential 0.5 * (1 - min(d, 100) / 100) (see Env::zombie_potentials).
   zombie_distance_shaping: 0.5
+  # No step penalty on S0: with rare catches it made a starvation ending worth ~40% of a
+  # catch (docs/ARCHITECTURE.md section 4.6); gamma already favors early catches.
+  zombie_step_penalty: 0.0

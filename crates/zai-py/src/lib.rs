@@ -148,13 +148,14 @@ impl Env {
         self.inner.reset(seed);
     }
 
-    /// Returns `(human_reward, zombie_reward, terminated, truncated, outcome_code)`.
+    /// Returns `(human_reward, zombie_rewards, terminated, truncated, outcome_code)`, with one
+    /// reward per zombie (team reward plus distance shaping).
     fn step(
         &mut self,
         movement: i64,
         interact: i64,
         zombie_actions: Vec<i64>,
-    ) -> PyResult<(f32, f32, bool, bool, u8)> {
+    ) -> PyResult<(f32, Vec<f32>, bool, bool, u8)> {
         if self.inner.outcome() != Outcome::Running {
             return Err(PyValueError::new_err(
                 "step() called on a finished episode; call reset()",
@@ -175,7 +176,7 @@ impl Env {
         let r = self.inner.step(h, &z);
         Ok((
             r.human_reward,
-            r.zombie_reward,
+            self.inner.zombie_rewards().to_vec(),
             r.terminated,
             r.truncated,
             outcome_code(r.outcome),
@@ -282,7 +283,7 @@ struct Buffers {
     zombie_valid: Py<PyArray2<bool>>,
     state: Py<PyArray2<f32>>,
     human_reward: Py<PyArray1<f32>>,
-    zombie_reward: Py<PyArray1<f32>>,
+    zombie_reward: Py<PyArray2<f32>>,
     terminated: Py<PyArray1<bool>>,
     truncated: Py<PyArray1<bool>>,
     outcome: Py<PyArray1<u8>>,
@@ -321,7 +322,7 @@ impl Buffers {
             zombie_valid: zombie_valid.unbind(),
             state: PyArray2::zeros(py, [e, STATE_DIM], false).unbind(),
             human_reward: PyArray1::zeros(py, [e], false).unbind(),
-            zombie_reward: PyArray1::zeros(py, [e], false).unbind(),
+            zombie_reward: PyArray2::zeros(py, [e, n], false).unbind(),
             terminated: PyArray1::zeros(py, [e], false).unbind(),
             truncated: PyArray1::zeros(py, [e], false).unbind(),
             outcome: PyArray1::zeros(py, [e], false).unbind(),
@@ -466,7 +467,7 @@ impl VecEnv {
     /// Steps every environment.
     ///
     /// `human_actions`: int64 `[E, 2]` (movement, interact); `zombie_actions`: int64 `[E, N]`.
-    /// Returns `(obs, human_reward, zombie_reward, terminated, truncated, info)`. Finished
+    /// Returns `(obs, human_reward [E], zombie_reward [E, N], terminated, truncated, info)`. Finished
     /// environments are reset automatically: `obs` holds the first observation of the new
     /// episode and `info["final_*"]` the last observation of the finished one (only rows where
     /// `terminated | truncated` are meaningful).
@@ -479,7 +480,7 @@ impl VecEnv {
     ) -> PyResult<(
         Bound<'py, PyDict>,
         Bound<'py, PyArray1<f32>>,
-        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray2<f32>>,
         Bound<'py, PyArray1<bool>>,
         Bound<'py, PyArray1<bool>>,
         Bound<'py, PyDict>,
@@ -526,7 +527,9 @@ impl VecEnv {
                         // SAFETY: each index is handled by exactly one worker.
                         unsafe {
                             raw.human_reward.row(i, 1)[0] = r.human_reward;
-                            raw.zombie_reward.row(i, 1)[0] = r.zombie_reward;
+                            raw.zombie_reward
+                                .row(i, n)
+                                .copy_from_slice(env.zombie_rewards());
                             raw.terminated.row(i, 1)[0] = r.terminated;
                             raw.truncated.row(i, 1)[0] = r.truncated;
                             raw.outcome.row(i, 1)[0] = outcome_code(r.outcome);

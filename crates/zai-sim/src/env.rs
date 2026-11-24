@@ -7,7 +7,7 @@ use glam::Vec2;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
-use crate::config::{Config, ConfigError};
+use crate::config::{Config, ConfigError, ZombieShapingMode};
 use crate::map::Map;
 
 /// Movement action meaning "do not move". Actions `0..16` move in direction `i * 22.5` degrees.
@@ -124,7 +124,8 @@ impl HumanAction {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StepResult {
     pub human_reward: f32,
-    /// Team reward, identical for every zombie.
+    /// Team part of the zombie reward (catch bonus and step penalty), identical for every
+    /// zombie. The full per-zombie reward, including distance shaping, is `Env::zombie_rewards`.
     pub zombie_reward: f32,
     pub terminated: bool,
     pub truncated: bool,
@@ -145,6 +146,8 @@ pub struct Env {
     pub(crate) decisions: u32,
     pub(crate) outcome: Outcome,
     pub(crate) events: Vec<NoiseEvent>,
+    /// Per-zombie reward of the last step (team reward plus distance shaping).
+    pub(crate) zombie_rewards: Vec<f32>,
 }
 
 impl Env {
@@ -174,6 +177,7 @@ impl Env {
             decisions: 0,
             outcome: Outcome::Running,
             events: Vec::new(),
+            zombie_rewards: Vec::new(),
         };
         env.reset(seed);
         Ok(env)
@@ -247,6 +251,8 @@ impl Env {
         self.decisions = 0;
         self.outcome = Outcome::Running;
         self.events.clear();
+        self.zombie_rewards.clear();
+        self.zombie_rewards.resize(self.zombies.len(), 0.0);
         self.update_perception();
     }
 
@@ -265,7 +271,8 @@ impl Env {
             "one action per zombie is required"
         );
         let phi_h0 = self.human_potential();
-        let phi_z0 = self.zombie_potential();
+        let mut phi_z0 = std::mem::take(&mut self.zombie_rewards);
+        self.zombie_potentials(&mut phi_z0);
         self.events.clear();
 
         // Interaction happens before movement; invalid (masked) interactions are no-ops.
@@ -304,24 +311,32 @@ impl Env {
         self.rewards(phi_h0, phi_z0)
     }
 
-    fn rewards(&self, phi_h0: f32, phi_z0: f32) -> StepResult {
-        let rc = &self.cfg.reward;
+    /// Computes the step rewards; `phi_z` holds the zombie potentials before the step and is
+    /// turned into the per-zombie rewards (`zombie_rewards`).
+    fn rewards(&mut self, phi_h0: f32, mut phi_z: Vec<f32>) -> StepResult {
         let terminated = matches!(self.outcome, Outcome::Caught | Outcome::Starved);
-        let (phi_h1, phi_z1) = if terminated {
-            (0.0, 0.0)
+        let phi_h1 = if terminated {
+            0.0
         } else {
-            (self.human_potential(), self.zombie_potential())
+            self.human_potential()
         };
+        let mut phi_z1 = vec![0.0; phi_z.len()];
+        self.zombie_potentials(&mut phi_z1);
+        let rc = &self.cfg.reward;
         let mut human_reward = if terminated {
             rc.human_death
         } else {
             rc.human_survival_per_step
         };
         human_reward += rc.gamma * phi_h1 - phi_h0;
-        let mut zombie_reward = rc.zombie_step_penalty + rc.gamma * phi_z1 - phi_z0;
+        let mut zombie_reward = rc.zombie_step_penalty;
         if self.outcome == Outcome::Caught {
             zombie_reward += rc.zombie_catch;
         }
+        for (r, p1) in phi_z.iter_mut().zip(phi_z1) {
+            *r = zombie_reward + rc.gamma * p1 - *r;
+        }
+        self.zombie_rewards = phi_z;
         StepResult {
             human_reward,
             zombie_reward,
@@ -352,18 +367,39 @@ impl Env {
         rc.human_food_shaping * (reserve + FOOD_PROXIMITY_WEIGHT * proximity)
     }
 
-    /// Potential for the zombie distance shaping (0 when disabled). Uses privileged state.
-    fn zombie_potential(&self) -> f32 {
-        let scale = self.cfg.reward.zombie_distance_shaping;
-        if scale == 0.0 {
-            return 0.0;
+    /// Per-zombie rewards of the last step: team reward plus potential-based distance shaping.
+    pub fn zombie_rewards(&self) -> &[f32] {
+        &self.zombie_rewards
+    }
+
+    /// Potentials of the zombie distance shaping (all 0 when disabled), written into `out`.
+    /// Uses privileged state. `Phi = c * (1 - min(d, range) / range)` is non-negative and
+    /// takes its maximum `c` when the human is caught and 0 when it starves, so neither
+    /// ending pays more than its own reward.
+    pub(crate) fn zombie_potentials(&self, out: &mut Vec<f32>) {
+        let rc = &self.cfg.reward;
+        let c = rc.zombie_distance_shaping;
+        out.clear();
+        let value = match self.outcome {
+            _ if c == 0.0 => Some(0.0),
+            Outcome::Caught => Some(c),
+            Outcome::Starved => Some(0.0),
+            Outcome::Running | Outcome::Truncated => None,
+        };
+        if let Some(v) = value {
+            out.resize(self.zombies.len(), v);
+            return;
         }
-        let min = self
-            .zombies
-            .iter()
-            .map(|z| z.pos.distance(self.human.pos))
-            .fold(f32::INFINITY, f32::min);
-        -scale * min / self.cfg.map_size_m
+        let range = rc.zombie_distance_shaping_range_m;
+        let phi = |d: f32| c * (1.0 - d.min(range) / range);
+        let dist = self.zombies.iter().map(|z| z.pos.distance(self.human.pos));
+        match rc.zombie_distance_shaping_mode {
+            ZombieShapingMode::PerAgent => out.extend(dist.map(phi)),
+            ZombieShapingMode::TeamMin => {
+                let v = phi(dist.fold(f32::INFINITY, f32::min));
+                out.resize(self.zombies.len(), v);
+            }
+        }
     }
 
     /// One physics tick. Returns the outcome if the episode ended.

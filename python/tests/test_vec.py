@@ -53,7 +53,7 @@ def test_vec_env_matches_single_envs_including_auto_reset(small_config):
                 int(human[i, 0]), int(human[i, 1]), zombies[i].tolist()
             )
             assert step.human_reward[i] == pytest.approx(hr, abs=0)
-            assert step.zombie_reward[i] == pytest.approx(zr, abs=0)
+            assert step.zombie_reward[i].tolist() == pytest.approx(zr, abs=0)
             assert (step.terminated[i], step.truncated[i], step.outcome[i]) == (
                 term,
                 trunc,

@@ -89,8 +89,24 @@ pub struct RewardConfig {
     pub human_food_shaping: f32,
     /// Food reserve (seconds until starvation) at which the food shaping saturates.
     pub human_food_shaping_reserve_s: f32,
-    /// Scale of the potential-based distance shaping for zombies (0 disables it).
+    /// Scale `c` of the potential-based distance shaping for zombies (0 disables it):
+    /// `Phi = c * (1 - min(d, range) / range)`, `c` when the human is caught, 0 when it starves.
     pub zombie_distance_shaping: f32,
+    /// Distance `range` at which the zombie distance potential reaches 0.
+    pub zombie_distance_shaping_range_m: f32,
+    /// Which distance drives each zombie's potential.
+    pub zombie_distance_shaping_mode: ZombieShapingMode,
+}
+
+/// Credit assignment of the zombie distance shaping.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZombieShapingMode {
+    /// Each zombie's own distance to the human.
+    #[default]
+    PerAgent,
+    /// The nearest zombie's distance, shared by the whole team.
+    TeamMin,
 }
 
 impl Default for Config {
@@ -173,6 +189,8 @@ impl Default for RewardConfig {
             human_food_shaping: 0.0,
             human_food_shaping_reserve_s: 180.0,
             zombie_distance_shaping: 0.0,
+            zombie_distance_shaping_range_m: 100.0,
+            zombie_distance_shaping_mode: ZombieShapingMode::PerAgent,
         }
     }
 }
@@ -229,6 +247,9 @@ impl Config {
         }
         if !(self.human.vision_fov_deg > 0.0 && self.human.vision_fov_deg <= 360.0) {
             return err("human.vision_fov_deg must be in (0, 360]".into());
+        }
+        if self.reward.zombie_distance_shaping_range_m <= 0.0 {
+            return err("reward.zombie_distance_shaping_range_m must be positive".into());
         }
         if let Some(i) = self.food_respawn_interval_s {
             if i < 0.0 {

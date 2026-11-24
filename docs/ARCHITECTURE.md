@@ -331,6 +331,42 @@ Tactic metrics (logged per evaluation, these show *what* is learned, not just re
 
 Baselines for every metric come from the scripted bots and random policies; "emergent tactics" means sustained improvement over those baselines, not just reward growth.
 
+### 4.6 M5 plan: zombie training
+
+Decisions accepted by the user (2026-11-24): zombie step penalty 0 on S0; per-agent distance shaping (team `min` kept for ablation); train against the scripted human only, with the frozen M4 human as an evaluation opponent; acceptance relative to the measured scripted-zombie baseline (the S0 gate of section 4.4 to be revisited in M6); observation normalization by `map_size_m` kept until M6 (fix it before S1, since changing it now invalidates the M4 checkpoint used as an evaluation opponent).
+
+**Data layout: flat agent axis, no padding.** Each env group has a fixed zombie count, so the total number of zombie agents `A = sum_g E_g * N_g` is constant for the whole run (S0, E=1024, counts 2/3/4: A ~ 3072). Zombie tensors are `[A, 252]` with a static `agent_env [A]` index (and `agent_slot [A]`). Rollout buffers are `[T, A, ...]`, so `gae()`, the `[T, E] -> [chunks*E, L]` BPTT reshape and the `h0` storage of `ppo_human.py` apply unchanged with `E` replaced by `A`. Per-env arrays (`done`, `state`) are broadcast with `agent_env`. This replaces the "pad to `N_max` with a validity mask" sketch of section 5.1; `zombie_valid` is all-true inside a group and is only asserted.
+
+**Reuse and new code (mapped onto M4):**
+
+| Piece | M4 code | M5 action |
+|---|---|---|
+| GAE, `RunningMeanStd`, `EpisodeStats`, `save_checkpoint`, BPTT reshape, clipped PPO loss | `algos/ppo_human.py` | Move to `algos/common.py`; `HumanPPO` imports them (no behavior change, existing tests must pass). |
+| GRU over segments split at episode starts | `HumanActor.sequence` | Extract `run_gru_segments(gru, x, h0, starts)` into `models/encoders.py`; used by both actors. |
+| `SetEncoder`, `RayEncoder`, `mlp` | `models/encoders.py` | Reused as is (16 zombie rays -> 4 conv positions). |
+| Env groups + fixed opponent | `envs.HumanTrainingEnv` | Generalize to `MatchTrainingEnv(groups, human_factory=None, zombie_factory=None)`: the side without a factory is supplied by the caller; `step()` returns both sides' views (human `[E]`, zombies flat `[A]` including `final_zombie_obs` / `final_state` regrouped). `HumanTrainingEnv` stays as a thin wrapper. This is also the M6 group A/B/C structure. |
+| Actor | `models/human.py` | New `models/zombie.py`: `ZombieActor` (self 12 + `SetEncoder` over heard 8x9 / peers 8x5 / houses 10x8 with valid masks + `RayEncoder` 16x3 -> MLP 128 -> GRU 128 -> 17 logits, no mask, no agent id), `step` and `sequence` with the same equivalence test as the human. |
+| Critic | `HumanCritic` (MLP on state) | `ZombieCritic`: agent-specific global state `concat(state[agent_env], own_obs)` = 1396 -> 512 -> 256 -> 1, per-agent value. Store `state` per env `[T, E, 1144]` (0.6 GB at E=1024) and gather at update time, not per agent (2.2 GB). |
+| Algorithm | `HumanPPO.collect/update` | New `algos/mappo_zombie.py` `ZombieMAPPO`: per-agent rewards, per-agent GAE and values, advantage normalization per minibatch over agents, value normalization, truncation bootstrap from `final_zombie_obs` + `final_state`; hyperparameters as section 4.1 with 3 epochs, 8 minibatches, `hidden 128`. |
+| Entrypoint | `train.py` (human only) | `TrainConfig.side: human | zombie` plus `opponent` and `mappo` sections; checkpoints under `/checkpoints/zombie/<run_id>/`; `MetricsLogger(run_id, "zombie")` (the server already accepts `zombie`). Configs `configs/train/zombie_s0.yaml` (CPU pilot, 256 envs) and `zombie_s0_gpu.yaml` (1024 envs, 20 sim threads); Makefile `train-zombie`, `train-zombie-gpu`. |
+| Eval policy wrapper | `policy.RecurrentHumanPolicy` | New `RecurrentZombiePolicy(actor, num_envs, num_zombies)`: `act([E, N, 252]) -> [E, N]`, `reset(done)` clears the N hidden states of finished envs; `from_checkpoint`. |
+| Replays | `arena/export_replays.py` (human checkpoint only) | Add `--zombie-checkpoint` and `--human {scripted,random,checkpoint}`; `record_episode` is already policy-agnostic; replay field `zombies: "policy"` (`ReplayAgent::Policy` exists). |
+
+**Rewards for M5 (replace the section 3.8 zombie shaping):**
+- Distance potential, per agent: `Phi_i(s) = c * (1 - min(d_i, D) / D)` with `d_i` the distance of zombie `i` to the human, `c = 0.5`, `D = 100 m` (a constant, so the per-meter signal does not change with the map size). Non-negative. Terminal potentials: `Phi_i(Caught) = c` (the value at `d = 0`) for every zombie, `Phi_i(Starved) = 0`; truncation uses the real `Phi_i(s_T)` and bootstraps. Per episode the shaping sums to `gamma^T * Phi_T - Phi_0`: a starvation ending adds nothing beyond the policy-independent `-Phi_0`, a catch adds an aligned bonus `+c * gamma^T` (catch effectively worth up to 1.5), so neither ending can be exploited. The current formula (`-scale * min_d / map_size`, terminal 0) paid up to `+0.5 * 212 / 150 ~ +0.71` on S0 for a starvation ending. The `(gamma - 1) * Phi` term costs at most `0.0025` per decision when close without catching, which pushes towards closing the gap (aligned), unlike the old negative form, which paid for staying far. Implemented in Rust (`Env::zombie_potential` per agent); `VecEnv` returns `zombie_reward [E, N]`; the team mode (nearest zombie) stays as `zombie_distance_shaping_mode: team_min` for ablation.
+- `zombie_step_penalty: 0` on S0. With `-0.002` per decision and a low catch probability, continuing is worth about `-0.002 / (1 - 0.995) = -0.4`, while a starvation ending is worth 0, so making the human starve is worth ~40% of a catch, which turns into a food-guarding objective that the PRD does not ask for. `gamma` already gives zombies a preference for early catches.
+- Catch `+1.0` shared by every zombie, unchanged.
+
+**S0 configuration:** `configs/env/s0.yaml` as in M4 (150 x 150 m, 3 houses, 20 food, 5 min cap, spawn distance 50 m, 120-degree human field of view, zombies 0.7 m/s), training counts 2/3/4 in equal groups, opponent `ScriptedHuman` (reserve 2, flee 30 m).
+
+**Baseline and acceptance:** the scripted-zombie catch rate against the scripted human on S0 has not been measured (M4 only logged the human's 82.8% survival). The trainer measures it at startup: `arena.matches.play` with scripted human vs scripted zombies, 256 episodes per count (2, 3, 4) on fixed seeds, reporting `eval/baseline_caught` per count and pooled with a Wilson 95% interval; random zombies are logged as the floor. Evaluation every 10 iterations uses the same seeds (paired). Acceptance: pooled learned catch rate above the baseline with non-overlapping 95% intervals (at 768 episodes and p ~ 0.1 the interval is about +/-2.1 points). Also reported, not gating: catch rate against the frozen M4 human (`human-s0-gpu1` latest), time to catch, starved share, mean nearest-zombie distance.
+
+**De-risking before the GPU run:**
+1. Tests (CPU, minutes): `ZombieActor.sequence` equals repeated `step` with resets; flat-agent regrouping round-trip; per-agent GAE stops at env done; truncation bootstrap uses `final_zombie_obs`; Rust rule tests for the potential (starvation ending pays 0, catch step pays `+1 + gamma * c - Phi`).
+2. Sanity run against `RandomHuman` (noisy, no fleeing), 128 envs, 2 M env steps (~15 min on the pilot): catch rate must clearly exceed scripted zombies vs random human.
+3. Pilot against the scripted human, 256 envs, 5-10 M env steps: go if the mean nearest-zombie distance falls, critic explained variance > 0.2 and `eval/caught` trends above the baseline.
+4. Read `perf/rollout_s` / `perf/update_s` of `human-s0-gpu1` (already logged) before the long run. Expected GPU throughput ~15-25 k env steps/s (45-75 k agent steps/s; the simulation cost equals M4 because `VecEnv` always encodes all observations; the update handles 3x more transitions with a smaller network), so 200 M env steps take ~2.5-4 h.
+
 ---
 
 ## 5. Communication protocols and data flow

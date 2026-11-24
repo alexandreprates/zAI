@@ -28,7 +28,7 @@ class VecObs:
 class VecStep:
     obs: VecObs
     human_reward: np.ndarray  # float32 [E]
-    zombie_reward: np.ndarray  # float32 [E], shared by every zombie of the env
+    zombie_reward: np.ndarray  # float32 [E, N]: team reward plus per-zombie distance shaping
     terminated: np.ndarray  # bool [E]
     truncated: np.ndarray  # bool [E]
     outcome: np.ndarray  # uint8 [E], index into OUTCOMES

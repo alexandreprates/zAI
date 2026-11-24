@@ -48,3 +48,5 @@ reward:
   human_food_shaping: 0.0
   human_food_shaping_reserve_s: 180.0
   zombie_distance_shaping: 0.0
+  zombie_distance_shaping_range_m: 100.0
+  zombie_distance_shaping_mode: per_agent

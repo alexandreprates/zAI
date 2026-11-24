@@ -66,7 +66,9 @@ proptest! {
                 assert!(p.min_element() >= r - 1e-4 && p.max_element() <= size - r + 1e-4);
                 assert!(env.map.clearance(p, r) >= r - 1e-3, "inside an obstacle at {p:?}");
             }
-            assert!(env.human.hunger_s <= env.cfg.human.hunger_interval_s + 1e-3);
+            // Eating triggers at `hunger_s <= dt / 2` (absorbing f32 drift), so right after
+            // eating the timer can exceed the interval by up to half a tick.
+            assert!(env.human.hunger_s <= env.cfg.human.hunger_interval_s + 0.5 * env.cfg.dt_s);
         });
     }
 
