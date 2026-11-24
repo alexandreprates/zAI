@@ -1,0 +1,57 @@
+# CPU-only by default (local pilot). For the NVIDIA GPU server add compose.gpu.yaml:
+#   docker compose -f compose.yaml -f compose.gpu.yaml ...
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: docker/dev.Dockerfile
+    volumes:
+      - .:/workspace
+      - dev-cache:/cache
+      - cargo-registry:/usr/local/cargo/registry
+      - web-node-modules:/workspace/web/node_modules
+    profiles: ["dev"]
+
+  server:
+    build:
+      context: .
+      dockerfile: docker/server.Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - data:/data
+
+  trainer:
+    build:
+      context: .
+      dockerfile: docker/trainer.Dockerfile
+      args:
+        TORCH_INDEX: cpu
+    shm_size: 8gb
+    environment:
+      ZAI_ZOMBIE_COUNT: ${ZAI_ZOMBIE_COUNT:-20}
+      ZAI_FOOD_COUNT: ${ZAI_FOOD_COUNT:-120}
+      ZAI_SERVER_URL: http://server:8080
+      ZAI_CHECKPOINT_DIR: /checkpoints
+      ZAI_RUNS_DIR: /runs
+    volumes:
+      - checkpoints:/checkpoints
+      - runs:/runs
+    profiles: ["train"]
+
+  tensorboard:
+    image: zai-trainer
+    command: tensorboard --logdir /runs --host 0.0.0.0 --port 6006
+    ports:
+      - "6006:6006"
+    volumes:
+      - runs:/runs
+    profiles: ["tensorboard"]
+
+volumes:
+  dev-cache:
+  web-node-modules:
+  cargo-registry:
+  data:
+  checkpoints:
+  runs:

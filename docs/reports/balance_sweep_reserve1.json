@@ -1,0 +1,229 @@
+{
+  "meta": {
+    "episodes_per_cell": 64,
+    "food_respawn_interval_s": 60.0,
+    "seed": 0,
+    "human_reserve": 1,
+    "zombie_speed_mps": 0.7,
+    "base_config": "defaults",
+    "elapsed_s": 36.6
+  },
+  "results": [
+    {
+      "zombies": 5,
+      "food": 20,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 1.0,
+      "survived": 0.0,
+      "mean_length_s": 310.78125
+    },
+    {
+      "zombies": 5,
+      "food": 40,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 0.96875,
+      "survived": 0.03125,
+      "mean_length_s": 517.03125
+    },
+    {
+      "zombies": 5,
+      "food": 80,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 0.8125,
+      "survived": 0.1875,
+      "mean_length_s": 791.71875
+    },
+    {
+      "zombies": 5,
+      "food": 120,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 0.59375,
+      "survived": 0.40625,
+      "mean_length_s": 886.875
+    },
+    {
+      "zombies": 10,
+      "food": 20,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 1.0,
+      "survived": 0.0,
+      "mean_length_s": 289.6875
+    },
+    {
+      "zombies": 10,
+      "food": 40,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 0.96875,
+      "survived": 0.03125,
+      "mean_length_s": 493.125
+    },
+    {
+      "zombies": 10,
+      "food": 80,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 0.84375,
+      "survived": 0.15625,
+      "mean_length_s": 650.15625
+    },
+    {
+      "zombies": 10,
+      "food": 120,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 0.765625,
+      "survived": 0.234375,
+      "mean_length_s": 756.5625
+    },
+    {
+      "zombies": 20,
+      "food": 20,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 1.0,
+      "survived": 0.0,
+      "mean_length_s": 277.03125
+    },
+    {
+      "zombies": 20,
+      "food": 40,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 1.0,
+      "survived": 0.0,
+      "mean_length_s": 381.09375
+    },
+    {
+      "zombies": 20,
+      "food": 80,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 0.9375,
+      "survived": 0.0625,
+      "mean_length_s": 550.3125
+    },
+    {
+      "zombies": 20,
+      "food": 120,
+      "episodes": 64,
+      "caught": 0.015625,
+      "starved": 0.84375,
+      "survived": 0.140625,
+      "mean_length_s": 630.2890625
+    },
+    {
+      "zombies": 35,
+      "food": 20,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 1.0,
+      "survived": 0.0,
+      "mean_length_s": 220.78125
+    },
+    {
+      "zombies": 35,
+      "food": 40,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 1.0,
+      "survived": 0.0,
+      "mean_length_s": 330.46875
+    },
+    {
+      "zombies": 35,
+      "food": 80,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 0.984375,
+      "survived": 0.015625,
+      "mean_length_s": 446.25
+    },
+    {
+      "zombies": 35,
+      "food": 120,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 0.96875,
+      "survived": 0.03125,
+      "mean_length_s": 532.5
+    },
+    {
+      "zombies": 50,
+      "food": 20,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 1.0,
+      "survived": 0.0,
+      "mean_length_s": 208.125
+    },
+    {
+      "zombies": 50,
+      "food": 40,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 1.0,
+      "survived": 0.0,
+      "mean_length_s": 299.53125
+    },
+    {
+      "zombies": 50,
+      "food": 80,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 0.984375,
+      "survived": 0.015625,
+      "mean_length_s": 392.8125
+    },
+    {
+      "zombies": 50,
+      "food": 120,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 0.984375,
+      "survived": 0.015625,
+      "mean_length_s": 436.40625
+    },
+    {
+      "zombies": 64,
+      "food": 20,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 1.0,
+      "survived": 0.0,
+      "mean_length_s": 216.5625
+    },
+    {
+      "zombies": 64,
+      "food": 40,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 1.0,
+      "survived": 0.0,
+      "mean_length_s": 278.4375
+    },
+    {
+      "zombies": 64,
+      "food": 80,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 1.0,
+      "survived": 0.0,
+      "mean_length_s": 392.34375
+    },
+    {
+      "zombies": 64,
+      "food": 120,
+      "episodes": 64,
+      "caught": 0.0,
+      "starved": 1.0,
+      "survived": 0.0,
+      "mean_length_s": 390.9375
+    }
+  ]
+}

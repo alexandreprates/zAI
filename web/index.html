@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ZAI Viewer</title>
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <h1>ZAI</h1>
+
+        <section>
+          <h2>New match</h2>
+          <form id="new-match">
+            <label>Human
+              <select name="human">
+                <option value="scripted">scripted</option>
+                <option value="random">random</option>
+              </select>
+            </label>
+            <label>Zombies
+              <select name="zombies">
+                <option value="scripted">scripted</option>
+                <option value="random">random</option>
+              </select>
+            </label>
+            <label>Zombie count <input name="zombie_count" type="number" min="1" max="64" placeholder="default" /></label>
+            <label>Food count <input name="food_count" type="number" min="0" max="128" placeholder="default" /></label>
+            <label>Seed <input name="seed" type="number" min="0" placeholder="random" /></label>
+            <label class="check"><input name="auto_restart" type="checkbox" checked /> Auto restart</label>
+            <button type="submit">Start</button>
+            <p id="form-error" class="error"></p>
+          </form>
+        </section>
+
+        <section>
+          <h2>Matches</h2>
+          <ul id="matches" class="list"></ul>
+        </section>
+
+        <section>
+          <h2>Replays</h2>
+          <ul id="replays" class="list"></ul>
+        </section>
+
+        <section>
+          <h2>Training runs</h2>
+          <ul id="runs" class="list"></ul>
+        </section>
+      </aside>
+
+      <main>
+        <div id="toolbar">
+          <button id="play-pause" disabled>Pause</button>
+          <div id="speeds"></div>
+          <input id="seek" type="range" min="0" max="0" value="0" hidden />
+          <span id="status">Select a match or replay</span>
+        </div>
+        <div id="stage"></div>
+        <div id="charts" hidden></div>
+        <div id="hud" hidden>
+          <div><span class="label">Time</span> <span id="hud-time"></span></div>
+          <div><span class="label">Hunger</span> <span class="bar"><span id="hud-hunger"></span></span> <span id="hud-hunger-s"></span></div>
+          <div><span class="label">Carried</span> <span id="hud-carried"></span></div>
+          <div><span class="label">Outcome</span> <span id="hud-outcome"></span></div>
+        </div>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

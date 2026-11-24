@@ -1,0 +1,14 @@
+# Curriculum stage S0 (docs/ARCHITECTURE.md section 4.4): small map, few zombies, short
+# episodes and potential-based food shaping. Merged over the defaults (configs/env/default.yaml).
+# Training samples the zombie count from the trainer's `zombie_counts`; this value is the one
+# used for evaluation.
+map_size_m: 150.0
+house_count: 3
+zombie_count: 3
+food_count: 20
+episode_cap_s: 300.0
+min_spawn_distance_m: 50.0
+reward:
+  # Potential-based food shaping (reserve + proximity, see Env::human_potential).
+  human_food_shaping: 1.0
+  zombie_distance_shaping: 0.5

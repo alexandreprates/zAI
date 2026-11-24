@@ -1,0 +1,223 @@
+"""Human training entrypoint (M4): recurrent PPO against fixed zombie bots.
+
+    python -m zai_rl.train --config configs/train/human_s0.yaml [--total-steps N] [--run-id ID]
+
+Metrics go to stdout, TensorBoard (`ZAI_RUNS_DIR`, default ./runs) and, when `ZAI_SERVER_URL`
+is set, to the zai-server metrics API (visible in the viewer). Checkpoints are written to
+`ZAI_CHECKPOINT_DIR` (default ./checkpoints) under `human/<run_id>/`.
+"""
+
+import argparse
+import logging
+import os
+import time
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+import yaml
+
+from arena.matches import play
+from zai_env.config import load_config
+
+from .algos.ppo_human import EpisodeStats, HumanPPO, PPOConfig, save_checkpoint
+from .bots import ScriptedHuman, ScriptedZombies
+from .envs import HumanTrainingEnv
+from .metrics import MetricsLogger
+from .policy import RecurrentHumanPolicy
+
+log = logging.getLogger("zai_rl.train")
+REPO = Path(__file__).resolve().parents[2]
+OUTCOME_KEYS = {1: "caught", 2: "starved", 3: "survived"}
+
+
+@dataclass
+class TrainConfig:
+    run_id: str | None = None
+    env_config: str = "configs/env/s0.yaml"
+    zombie_counts: list[int] = field(default_factory=lambda: [2, 3, 4])
+    total_steps: int = 20_000_000
+    seed: int = 0
+    num_threads: int | None = None
+    torch_threads: int | None = None
+    device: str = "auto"
+    eval_every: int = 10
+    eval_episodes: int = 64
+    checkpoint_every: int = 20
+    ppo: PPOConfig = field(default_factory=PPOConfig)
+
+    @classmethod
+    def load(cls, path: Path | None, overrides: dict[str, Any]) -> "TrainConfig":
+        raw: dict[str, Any] = {}
+        if path is not None:
+            with open(path) as f:
+                raw = yaml.safe_load(f) or {}
+        raw.update({k: v for k, v in overrides.items() if v is not None})
+        known = {f.name for f in fields(cls)}
+        unknown = set(raw) - known
+        if unknown:
+            raise ValueError(f"unknown train config keys: {sorted(unknown)}")
+        ppo = PPOConfig(**raw.pop("ppo", {}))
+        return cls(**raw, ppo=ppo)
+
+
+def resolve(path: str) -> Path:
+    """Relative paths resolve against the working directory, then the source checkout."""
+    p = Path(path)
+    if p.is_absolute() or p.exists():
+        return p
+    return REPO / p
+
+
+def evaluate(env_cfg: dict[str, Any], algo: HumanPPO, episodes: int, seed: int) -> dict[str, float]:
+    stats = play(
+        env_cfg,
+        lambda c, e, s: RecurrentHumanPolicy(algo.actor, e, algo.device),
+        lambda c, e, n, s: ScriptedZombies(c, e, n, seed=s),
+        episodes=episodes,
+        seed=seed,
+    )
+    return {
+        "eval/survived": stats.survived,
+        "eval/caught": stats.caught,
+        "eval/starved": stats.starved,
+        "eval/mean_length_s": stats.mean_length_s,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train the human policy with recurrent PPO.")
+    parser.add_argument("--config", type=Path, default=Path("configs/train/human_s0.yaml"))
+    parser.add_argument("--run-id")
+    parser.add_argument("--total-steps", type=int)
+    parser.add_argument("--device")
+    parser.add_argument("--resume", type=Path, help="checkpoint to resume from")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    cfg = TrainConfig.load(
+        resolve(str(args.config)),
+        {"run_id": args.run_id, "total_steps": args.total_steps, "device": args.device},
+    )
+    run_id = cfg.run_id or time.strftime("human-s0-%Y%m%d-%H%M%S")
+    device = torch.device(
+        ("cuda" if torch.cuda.is_available() else "cpu") if cfg.device == "auto" else cfg.device
+    )
+    if cfg.torch_threads:
+        torch.set_num_threads(cfg.torch_threads)
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+
+    # Curriculum stage configs fix their own counts; ZAI_ZOMBIE_COUNT / ZAI_FOOD_COUNT apply to
+    # live matches and full-spec runs, not to these stages.
+    env_cfg = load_config(resolve(cfg.env_config), env_overrides=False)
+    decision_s = env_cfg["dt_s"] * env_cfg["action_repeat"]
+    env = HumanTrainingEnv(
+        env_cfg,
+        cfg.zombie_counts,
+        cfg.ppo.num_envs,
+        lambda c, e, n, s: ScriptedZombies(c, e, n, seed=s),
+        seed=cfg.seed,
+        num_threads=cfg.num_threads,
+    )
+    algo = HumanPPO(cfg.ppo, device)
+    iteration, steps = 0, 0
+    if args.resume:
+        sd = torch.load(args.resume, map_location=device, weights_only=False)
+        algo.load_state_dict(sd)
+        iteration, steps = sd["iteration"], sd["steps"]
+        run_id = sd.get("run_id", run_id)
+        log.info("resumed %s at iteration %d (%d steps)", args.resume, iteration, steps)
+
+    ckpt_dir = Path(os.environ.get("ZAI_CHECKPOINT_DIR", "checkpoints")) / "human" / run_id
+    metrics = MetricsLogger(
+        run_id,
+        "human",
+        server_url=os.environ.get("ZAI_SERVER_URL"),
+        tensorboard_dir=Path(os.environ.get("ZAI_RUNS_DIR", "runs")),
+    )
+    params = sum(p.numel() for p in algo.actor.parameters())
+    log.info(
+        "run %s on %s; actor %.2fM params; %d envs", run_id, device, params / 1e6, env.num_envs
+    )
+
+    baseline = play(
+        env_cfg,
+        lambda c, e, s: ScriptedHuman(c, e, seed=s),
+        lambda c, e, n, s: ScriptedZombies(c, e, n, seed=s),
+        episodes=cfg.eval_episodes,
+        seed=cfg.seed + 777,
+    )
+    log.info(
+        "baseline (scripted human vs scripted zombies): survived %.1f%%", 100 * baseline.survived
+    )
+
+    batch = env.reset()
+    h = algo.actor.initial_state(env.num_envs, device)
+    start = torch.ones(env.num_envs, dtype=torch.bool, device=device)
+    ep_return = np.zeros(env.num_envs, dtype=np.float64)
+    per_iter = cfg.ppo.rollout * env.num_envs
+    started = time.time()
+    while steps < cfg.total_steps:
+        t0 = time.time()
+        ep = EpisodeStats()
+        rollout, batch, h, start = algo.collect(env, batch, h, start, ep_return, ep)
+        t1 = time.time()
+        stats = algo.update(rollout, steps / cfg.total_steps)
+        t2 = time.time()
+        iteration += 1
+        steps += per_iter
+
+        scalars = dict(stats)
+        scalars["perf/steps_per_s"] = per_iter / (t2 - t0)
+        scalars["perf/rollout_s"] = t1 - t0
+        scalars["perf/update_s"] = t2 - t1
+        scalars["train/reward_mean"] = rollout["rewards"].mean().item()
+        if ep.returns:
+            outcomes = np.array(ep.outcomes)
+            scalars["episode/return"] = float(np.mean(ep.returns))
+            scalars["episode/length_s"] = float(np.mean(ep.lengths)) * decision_s
+            scalars["episode/count"] = len(ep.returns)
+            for code, name in OUTCOME_KEYS.items():
+                scalars[f"episode/{name}"] = float((outcomes == code).mean())
+
+        if iteration % cfg.eval_every == 0:
+            ev = evaluate(env_cfg, algo, cfg.eval_episodes, cfg.seed + 777)
+            scalars.update(ev)
+            scalars["eval/baseline_survived"] = baseline.survived
+            log.info(
+                "eval: survived %.1f%% (baseline %.1f%%), caught %.1f%%, starved %.1f%%",
+                100 * ev["eval/survived"],
+                100 * baseline.survived,
+                100 * ev["eval/caught"],
+                100 * ev["eval/starved"],
+            )
+
+        metrics.log(steps, scalars)
+        log.info(
+            "it %d steps %d | return %.3f len %.0fs survived %.2f | %.0f steps/s",
+            iteration,
+            steps,
+            scalars.get("episode/return", float("nan")),
+            scalars.get("episode/length_s", float("nan")),
+            scalars.get("episode/survived", float("nan")),
+            scalars["perf/steps_per_s"],
+        )
+        if iteration % cfg.checkpoint_every == 0 or steps >= cfg.total_steps:
+            extra = {
+                "iteration": iteration,
+                "steps": steps,
+                "run_id": run_id,
+                "env_config": env_cfg,
+            }
+            save_checkpoint(ckpt_dir / f"it{iteration:06d}.pt", algo, extra)
+            save_checkpoint(ckpt_dir / "latest.pt", algo, extra)
+
+    metrics.close()
+    log.info("done: %d steps in %.0f s", steps, time.time() - started)
+
+
+if __name__ == "__main__":
+    main()

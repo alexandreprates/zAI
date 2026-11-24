@@ -1,0 +1,209 @@
+import "./style.css";
+
+import { createMatch, listMatches, listReplays, listRuns, stopMatch, Stream } from "./api";
+import { Charts } from "./charts";
+import { TopDown } from "./topdown";
+import type { Frame, InitFrame, SnapshotFrame } from "./types";
+
+const SPEEDS = [0.5, 1, 2, 4, 8, 16];
+
+const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+const view = new TopDown();
+let charts: Charts;
+let stream: Stream | null = null;
+let init: InitFrame | null = null;
+let last: SnapshotFrame | null = null;
+let selected: string | null = null;
+let seeking = false;
+
+function formatTime(s: number): string {
+  const m = Math.floor(s / 60);
+  return `${m}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+}
+
+function onFrame(frame: Frame): void {
+  if (frame.type === "init") {
+    init = frame;
+    view.setInit(frame);
+    const seek = $<HTMLInputElement>("seek");
+    seek.hidden = frame.source !== "replay";
+    seek.max = String(frame.total_ticks ?? 0);
+    $("hud").hidden = false;
+    return;
+  }
+  last = frame;
+  view.pushSnapshot(frame);
+  renderControls();
+}
+
+function renderControls(): void {
+  if (!init || !last) return;
+  const s = last;
+  const hungerInterval = init.config.human.hunger_interval_s;
+  $("hud-time").textContent = `${formatTime(s.time)} (tick ${s.tick})`;
+  $("hud-hunger").style.width = `${Math.max(0, Math.min(1, s.human.hunger / hungerInterval)) * 100}%`;
+  $("hud-hunger-s").textContent = `${s.human.hunger.toFixed(0)} s`;
+  $("hud-carried").textContent = String(s.human.carried);
+  $("hud-outcome").textContent = s.outcome;
+  const kind = init.source === "replay" ? "Replay" : "Match";
+  $("status").textContent = `${kind} ${init.id} · episode ${init.episode} · ${s.speed > 0 ? `x${s.speed}` : "max"}${s.paused ? " · paused" : ""}`;
+  const btn = $<HTMLButtonElement>("play-pause");
+  btn.disabled = false;
+  btn.textContent = s.paused ? "Play" : "Pause";
+  for (const b of document.querySelectorAll<HTMLButtonElement>("#speeds button")) {
+    b.classList.toggle("active", Number(b.dataset.speed) === s.speed);
+  }
+  if (!seeking) $<HTMLInputElement>("seek").value = String(s.tick);
+}
+
+function showStage(visible: boolean): void {
+  $("stage").hidden = !visible;
+  for (const id of ["play-pause", "speeds"]) $(id).hidden = !visible;
+  if (!visible) {
+    $("hud").hidden = true;
+    $<HTMLInputElement>("seek").hidden = true;
+  }
+}
+
+function showRun(runId: string): void {
+  stream?.close();
+  stream = null;
+  selected = `t:${runId}`;
+  init = last = null;
+  showStage(false);
+  $("status").textContent = `Training run ${runId}`;
+  void charts.show(runId).catch((e) => ($("status").textContent = (e as Error).message));
+  void refreshLists();
+}
+
+function watch(path: string, key: string): void {
+  stream?.close();
+  charts.hide();
+  showStage(true);
+  selected = key;
+  init = last = null;
+  stream = new Stream(path, onFrame, () => {
+    $("status").textContent = "Disconnected";
+  });
+  void refreshLists();
+}
+
+let lastLists = "";
+
+function item(title: string, detail: string, key: string, onOpen: () => void): HTMLLIElement {
+  const li = document.createElement("li");
+  li.classList.toggle("selected", selected === key);
+  const open = document.createElement("button");
+  open.className = "item";
+  const name = document.createElement("span");
+  name.textContent = title;
+  const small = document.createElement("small");
+  small.textContent = detail;
+  open.append(name, small);
+  open.onclick = onOpen;
+  li.appendChild(open);
+  return li;
+}
+
+async function refreshLists(): Promise<void> {
+  try {
+    const [matches, replays, runs] = await Promise.all([listMatches(), listReplays(), listRuns()]);
+    // Re-render only on change, so clicks are not lost to a DOM swap.
+    const signature = JSON.stringify([matches, replays, runs, selected]);
+    if (signature === lastLists) return;
+    lastLists = signature;
+    $("matches").replaceChildren(
+      ...matches.map((m) => {
+        const key = `m:${m.id}`;
+        const li = item(m.id, `${m.status} · ep ${m.episode} · ${m.outcome}`, key, () =>
+          watch(`/ws/match/${m.id}`, key),
+        );
+        if (m.status === "running") {
+          const stop = document.createElement("button");
+          stop.textContent = "Stop";
+          stop.className = "small";
+          stop.onclick = () => void stopMatch(m.id).then(refreshLists);
+          li.appendChild(stop);
+        }
+        return li;
+      }),
+    );
+    $("replays").replaceChildren(
+      ...replays.map((r) => {
+        const key = `r:${r.id}`;
+        return item(r.id, `${r.outcome} · ${r.length} ticks · ${r.human}/${r.zombies}`, key, () =>
+          watch(`/ws/replay/${r.id}`, key),
+        );
+      }),
+    );
+    $("runs").replaceChildren(
+      ...runs.map((r) =>
+        item(r.run_id, `${r.models.join(", ")} · step ${r.last_step.toLocaleString()}`, `t:${r.run_id}`, () =>
+          showRun(r.run_id),
+        ),
+      ),
+    );
+  } catch (e) {
+    $("status").textContent = `Server unavailable: ${(e as Error).message}`;
+  }
+}
+
+function setupControls(): void {
+  const speeds = $("speeds");
+  for (const s of SPEEDS) {
+    const b = document.createElement("button");
+    b.textContent = `x${s}`;
+    b.dataset.speed = String(s);
+    b.onclick = () => stream?.send({ cmd: "speed", value: s });
+    speeds.appendChild(b);
+  }
+  const toggle = () => stream?.send(last?.paused ? { cmd: "play" } : { cmd: "pause" });
+  $("play-pause").onclick = toggle;
+  document.addEventListener("keydown", (ev) => {
+    if (ev.code === "Space" && !(ev.target instanceof HTMLInputElement)) {
+      ev.preventDefault();
+      toggle();
+    }
+  });
+  const seek = $<HTMLInputElement>("seek");
+  seek.oninput = () => (seeking = true);
+  seek.onchange = () => {
+    seeking = false;
+    stream?.send({ cmd: "seek", tick: Number(seek.value) });
+  };
+
+  const form = $<HTMLFormElement>("new-match");
+  form.onsubmit = async (ev) => {
+    ev.preventDefault();
+    const data = new FormData(form);
+    const config: Record<string, number> = {};
+    for (const key of ["zombie_count", "food_count"]) {
+      const v = String(data.get(key) ?? "");
+      if (v !== "") config[key] = Number(v);
+    }
+    const seed = String(data.get("seed") ?? "");
+    try {
+      $("form-error").textContent = "";
+      const m = await createMatch({
+        human: data.get("human"),
+        zombies: data.get("zombies"),
+        auto_restart: data.get("auto_restart") === "on",
+        config,
+        ...(seed !== "" ? { seed: Number(seed) } : {}),
+      });
+      watch(`/ws/match/${m.id}`, `m:${m.id}`);
+    } catch (e) {
+      $("form-error").textContent = (e as Error).message;
+    }
+  };
+}
+
+async function main(): Promise<void> {
+  await view.mount($("stage"));
+  charts = new Charts($("charts"));
+  setupControls();
+  await refreshLists();
+  setInterval(refreshLists, 3000);
+}
+
+void main();

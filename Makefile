@@ -1,0 +1,71 @@
+# All targets run inside containers; only Docker (Compose v2) is needed on the host.
+# Targets prefixed with `ci-` run inside the dev container.
+
+# Build and run images for the host's native architecture, even if the shell sets
+# DOCKER_DEFAULT_PLATFORM (emulated amd64 would distort simulation benchmarks).
+# compose.gpu.yaml still pins the trainer to linux/amd64 for the GPU server.
+unexport DOCKER_DEFAULT_PLATFORM
+
+DEV := docker compose run --rm -T dev
+GPU := docker compose -f compose.yaml -f compose.gpu.yaml
+
+.PHONY: test lint fmt shell build up train-human train-human-gpu tensorboard web-install web-dev check-gpu ci-test ci-lint ci-fmt ci-py-develop ci-web-install
+
+test: ## Run Rust and Python tests
+	$(DEV) make ci-test
+
+lint: ## Run rustfmt check, clippy, ruff and the TypeScript type check
+	$(DEV) make ci-lint
+
+fmt: ## Format Rust and Python code
+	$(DEV) make ci-fmt
+
+shell: ## Open a shell in the dev container
+	docker compose run --rm dev bash
+
+build: ## Build the server (with the web viewer) and (CPU) trainer images
+	docker compose --profile train build server trainer
+
+up: ## Run the server with the viewer on http://localhost:8080
+	docker compose up --build server
+
+train-human: ## Train the human (M4) in the trainer container; ARGS="--total-steps N --run-id ID"
+	docker compose --profile train run --rm --build trainer python -m zai_rl.train --config /app/configs/train/human_s0.yaml $(ARGS)
+
+train-human-gpu: ## On the GPU server: human PPO with CUDA (configs/train/human_s0_gpu.yaml); see docs/GPU_SERVER.md
+	$(GPU) --profile train run --rm --build trainer python -m zai_rl.train --config /app/configs/train/human_s0_gpu.yaml $(ARGS)
+
+tensorboard: ## TensorBoard on http://localhost:6006 over the runs volume
+	docker compose --profile tensorboard up tensorboard
+
+web-install: ## Install the viewer's npm dependencies (into a volume)
+	$(DEV) make ci-web-install
+
+web-dev: ## Vite dev server on http://localhost:5173, proxying to a server on the host's port 8080
+	docker compose run --rm -p 5173:5173 -e ZAI_SERVER=http://host.docker.internal:8080 dev bash -c "make ci-web-install && cd web && npm run dev"
+
+check-gpu: ## On the GPU server: verify the CUDA build has sm_60 kernels and sees the P100
+	$(GPU) run --rm --build trainer python -m zai_rl.check_gpu --require-gpu
+
+ci-py-develop:
+	uv pip install -e python
+	maturin develop --uv --release -m crates/zai-py/Cargo.toml
+
+ci-test: ci-py-develop
+	cargo test --workspace --exclude zai-py
+	pytest python
+
+ci-web-install:
+	cd web && npm ci
+
+ci-lint: ci-web-install
+	cargo fmt --all --check
+	cargo clippy --workspace --all-targets -- -D warnings
+	ruff check python
+	ruff format --check python
+	cd web && npm run typecheck
+
+ci-fmt:
+	cargo fmt --all
+	ruff format python
+	ruff check --fix python

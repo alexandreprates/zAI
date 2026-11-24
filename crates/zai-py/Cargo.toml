@@ -1,0 +1,22 @@
+[package]
+name = "zai-py"
+description = "Python bindings (module `zai_sim`) for the ZAI simulation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "zai_sim"
+crate-type = ["cdylib"]
+# Linking a test binary would require libpython; the bindings are tested from Python.
+test = false
+doctest = false
+
+[dependencies]
+zai-sim.workspace = true
+numpy = "0.25"
+pyo3 = "0.25"
+rayon = "1"
+serde_json = "1"

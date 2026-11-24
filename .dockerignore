@@ -1,0 +1,9 @@
+target
+**/__pycache__
+**/.venv
+**/.pytest_cache
+**/.ruff_cache
+.git
+**/node_modules
+web/dist
+data

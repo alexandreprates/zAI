@@ -1,0 +1,12 @@
+/target
+__pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.so
+node_modules/
+web/dist/
+data/
+checkpoints/
+runs/
+*.pt

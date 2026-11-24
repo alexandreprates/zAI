@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/zai-sim", "crates/zai-py", "crates/zai-server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+zai-sim = { path = "crates/zai-sim" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

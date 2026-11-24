@@ -1,0 +1,84 @@
+// Frames and API payloads produced by zai-server (crates/zai-server/src/frames.rs, api.rs).
+
+export interface HouseFrame {
+  x: number;
+  y: number;
+  angle: number;
+  walls: [number, number, number, number][];
+  doors: [number, number, number, number][];
+}
+
+export interface InitFrame {
+  type: "init";
+  source: "live" | "replay";
+  id: string;
+  episode: number;
+  seed: number;
+  total_ticks: number | null;
+  decision_dt: number;
+  config: {
+    map_size_m: number;
+    entity_radius_m: number;
+    human: { vision_radius_m: number; vision_fov_deg: number; hunger_interval_s: number };
+    zombie: { hearing_radius_m: number };
+  };
+  map_size: number;
+  houses: HouseFrame[];
+}
+
+export interface SnapshotFrame {
+  type: "snapshot";
+  tick: number;
+  time: number;
+  speed: number;
+  paused: boolean;
+  human: { x: number; y: number; hx: number; hy: number; carried: number; hunger: number };
+  zombies: [number, number, number, number][];
+  doors: number;
+  food: [number, number][];
+  /** [kind (0 walk, 1 pickup, 2 door), x, y, radius] */
+  events: [number, number, number, number][];
+  outcome: "running" | "caught" | "starved" | "truncated";
+}
+
+export type Frame = InitFrame | SnapshotFrame;
+
+export interface MatchInfo {
+  id: string;
+  human: string;
+  zombies: string;
+  episode: number;
+  tick: number;
+  time: number;
+  speed: number;
+  paused: boolean;
+  status: "running" | "finished" | "stopped";
+  outcome: string;
+  replays: string[];
+}
+
+export interface ReplaySummary {
+  id: string;
+  match_id: string;
+  episode: number;
+  seed: number;
+  human: string;
+  zombies: string;
+  outcome: string;
+  length: number;
+}
+
+export interface MetricPoint {
+  model: string;
+  key: string;
+  step: number;
+  wall_time: number;
+  value: number;
+}
+
+export interface RunSummary {
+  run_id: string;
+  models: string[];
+  last_step: number;
+  updated: number;
+}

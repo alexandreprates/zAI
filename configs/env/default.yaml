@@ -1,0 +1,50 @@
+# Environment defaults from ZAI_PRD.md and docs/ARCHITECTURE.md (curriculum stage S2).
+# Keys mirror the Rust `Config` struct (crates/zai-sim/src/config.rs); unknown keys are rejected.
+# ZAI_ZOMBIE_COUNT and ZAI_FOOD_COUNT environment variables override the counts.
+map_size_m: 500.0
+house_count: 10
+zombie_count: 20
+food_count: 120
+food_respawn_interval_s: 60.0   # null disables respawn
+episode_cap_s: 1200.0
+dt_s: 0.1
+action_repeat: 5
+min_spawn_distance_m: 150.0
+entity_radius_m: 0.3
+pickup_range_m: 1.5
+door_range_m: 2.0
+food_inside_house_fraction: 0.05
+
+human:
+  vision_radius_m: 100.0
+  vision_fov_deg: 120.0         # frontal field of view around the heading (360 = omnidirectional)
+  base_speed_mps: 1.0
+  speed_penalty_per_food: 0.2   # fraction of base speed, linear
+  hunger_interval_s: 90.0
+
+zombie:
+  hearing_radius_m: 300.0
+  speed_mps: 0.7   # PRD originally 0.5; raised after the M2 balance sweep
+
+noise:
+  walk_radius_m: 10.0
+  food_pickup_radius_m: 100.0
+  door_close_radius_m: 200.0
+  localization_sigma: 0.0
+  memory_s: 30.0
+
+house:
+  width_m: 12.0
+  depth_m: 8.0
+  door_width_m: 1.5
+  jitter_m: 30.0
+
+reward:
+  gamma: 0.995
+  human_survival_per_step: 0.005
+  human_death: -1.0
+  zombie_catch: 1.0
+  zombie_step_penalty: -0.002
+  human_food_shaping: 0.0
+  human_food_shaping_reserve_s: 180.0
+  zombie_distance_shaping: 0.0
