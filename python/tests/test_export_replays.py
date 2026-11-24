@@ -66,3 +66,28 @@ def test_policy_episode_is_written_as_a_loadable_replay(tmp_path):
 def test_replay_ids_are_server_safe():
     assert replay_id_prefix("human-s0-gpu1-latest") == "human-s0-gpu1-latest"
     assert replay_id_prefix("../a b.pt") == "---a-b-pt"
+
+
+def test_training_replays_use_fixed_seeds_and_iteration_ids(tmp_path):
+    from arena.export_replays import record_training_replays
+
+    cfg = short_config()
+
+    def human(seed):
+        return ScriptedHuman(cfg, 1, seed=seed), "scripted"
+
+    def zombies(seed):
+        return ScriptedZombies(cfg, 1, 3, seed=seed), "scripted"
+
+    long_run = "zombie-s0-a-very-long-run-identifier-that-goes-past-the-limit"
+    first = record_training_replays(tmp_path, long_run, 1, cfg, human, zombies, episodes=2)
+    later = record_training_replays(tmp_path, long_run, 25, cfg, human, zombies, episodes=2)
+    ids = [r["id"] for r in first + later]
+    assert all(len(i) <= 64 and replay_id_prefix(i) == i for i in ids)
+    assert ids[0].endswith("-it000001-e0") and ids[3].endswith("-it000025-e1")
+    replays = [json.loads((tmp_path / f"{i}.json").read_text()) for i in ids]
+    assert {r["match_id"] for r in replays} == {long_run}
+    assert [r["episode"] for r in replays] == [1, 1, 25, 25]
+    # Same scenario at every iteration: episode k always uses the same seed.
+    assert replays[0]["seed"] == replays[2]["seed"] != replays[1]["seed"]
+    assert all(resimulate(r) == r["final_hash"] for r in replays)

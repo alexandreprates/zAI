@@ -14,6 +14,8 @@ eval_episodes: 128
 baseline_episodes: 256
 eval_human_checkpoint: /checkpoints/human/human-s0-gpu1/latest.pt
 checkpoint_every: 20
+replay_every: 25
+replay_episodes: 2
 mappo:
   num_envs: 1024
   rollout: 128

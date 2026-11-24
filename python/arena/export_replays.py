@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,6 @@ from zai_env.config import load_config
 from zai_env.vec import OUTCOMES
 from zai_rl.bots import RandomHuman, RandomZombies, ScriptedHuman, ScriptedZombies
 from zai_rl.policy import RecurrentHumanPolicy, RecurrentZombiePolicy
-from zai_rl.train import resolve
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +72,49 @@ def default_out_dir() -> Path:
     return Path(os.environ.get("ZAI_DATA_DIR", "/data")) / "replays"
 
 
+def training_replay_dir() -> Path | None:
+    """Replay directory for episodes recorded during training, only when `ZAI_DATA_DIR` is
+    set (the trainer container shares the server's `data` volume)."""
+    data = os.environ.get("ZAI_DATA_DIR")
+    return Path(data) / "replays" if data else None
+
+
+def record_training_replays(
+    out_dir: Path,
+    run_id: str,
+    iteration: int,
+    config: dict[str, Any],
+    make_human: Callable[[int], tuple[Any, str]],
+    make_zombies: Callable[[int], tuple[Any, str]],
+    episodes: int,
+    seed: int = 4242,
+) -> list[dict[str, Any]]:
+    """Records `episodes` episodes of the current policies on fixed seeds (the same seeds at
+    every call, so the viewer compares one scenario across the run). `make_*` build a
+    `num_envs=1` policy for an episode seed and return it with its replay kind. Replays are
+    grouped under `match_id = run_id`; ids are `<run_id>-it<iteration>-e<k>`."""
+    # Keep the iteration in the id even for long run ids (ids are capped at 64 characters).
+    prefix = f"{replay_id_prefix(run_id)[:44]}-it{iteration:06d}"
+    summaries = []
+    for k in range(episodes):
+        ep_seed = zai_sim.episode_seed(seed, 0, k)
+        human, human_kind = make_human(ep_seed)
+        zombies, zombie_kind = make_zombies(ep_seed)
+        episode = record_episode(config, ep_seed, human, zombies)
+        replay = {
+            "id": f"{prefix}-e{k}",
+            "match_id": run_id,
+            "episode": iteration,
+            "created_at": int(time.time()),
+            "human": human_kind,
+            "zombies": zombie_kind,
+            **episode,
+        }
+        write_replay(out_dir, replay)
+        summaries.append({"id": replay["id"], "outcome": episode["outcome"]})
+    return summaries
+
+
 def checkpoint_name(path: Path) -> str:
     return f"{path.parent.name}-{path.stem}"
 
@@ -95,6 +138,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.human_checkpoint is None and args.zombie_checkpoint is None:
         parser.error("give --checkpoint (human) and/or --zombie-checkpoint")
+
+    from zai_rl.train import resolve  # lazy: zai_rl.train imports this module
 
     torch.set_num_threads(1)
     overrides = {"zombie_count": args.zombie_count} if args.zombie_count else None

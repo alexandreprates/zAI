@@ -271,3 +271,49 @@ button[hidden] {
   color: var(--muted);
   font-size: 12px;
 }
+
+#run-replays {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  font-size: 12px;
+}
+
+#run-replays[hidden] {
+  display: none;
+}
+
+#run-replays .label {
+  color: var(--muted);
+  margin-right: 4px;
+}
+
+.chip {
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.chip.caught {
+  border-color: #e5484d80;
+}
+
+.chip.truncated {
+  border-color: #3ecf8e80;
+}
+
+.chip.starved {
+  border-color: #f5c45180;
+}
+
+.chip.active {
+  border-color: var(--accent);
+  background: #4ea8ff26;
+}

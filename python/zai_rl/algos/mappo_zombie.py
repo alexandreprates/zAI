@@ -17,9 +17,18 @@ import numpy as np
 import torch
 from torch import nn
 
+from zai_env.layout import STATE
+
 from ..envs import ZombieBatch, ZombieTrainingEnv
 from ..models import ZombieActor, ZombieCritic
 from .common import EpisodeStats, RunningMeanStd, bptt_sequences, gae
+
+
+def nearest_zombie_m(state: np.ndarray, map_size_m: float) -> np.ndarray:
+    """Distance from the human to the nearest zombie per env, from the global state `[E, S]`."""
+    dist = STATE.field(state, "zombies", "dist_to_human")
+    valid = STATE.field(state, "zombies", "valid") > 0.5
+    return np.where(valid, dist, np.inf).min(axis=1) * map_size_m
 
 
 @dataclass
@@ -94,7 +103,9 @@ class ZombieMAPPO:
             )
         }
         h0 = []
+        nearest = []
         for t in range(T):
+            nearest.append(nearest_zombie_m(batch.state, env.map_size_m).mean())
             obs = self._t(batch.obs)
             state = self._t(batch.state)
             h = h * (~start).unsqueeze(1)
@@ -154,6 +165,8 @@ class ZombieMAPPO:
         )
         rollout["advantages"], rollout["returns"] = adv, ret
         rollout["agent_env"] = agent_env
+        # Mean distance from the human to the nearest zombie over the rollout (diagnostic).
+        rollout["nearest_zombie_m"] = torch.tensor(float(np.mean(nearest)))
         return rollout, batch, h, start
 
     # --- update -------------------------------------------------------------------------

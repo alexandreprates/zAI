@@ -19,6 +19,7 @@ import numpy as np
 import torch
 import yaml
 
+from arena.export_replays import record_training_replays, training_replay_dir
 from arena.matches import play
 from zai_env.config import load_config
 
@@ -46,6 +47,10 @@ class TrainConfig:
     eval_every: int = 10
     eval_episodes: int = 64
     checkpoint_every: int = 20
+    # At iteration 1 and every `replay_every` iterations (0 disables), record `replay_episodes`
+    # episodes of the current policy into the server replays (needs ZAI_DATA_DIR).
+    replay_every: int = 0
+    replay_episodes: int = 2
     ppo: PPOConfig = field(default_factory=PPOConfig)
 
     @classmethod
@@ -154,6 +159,7 @@ def main() -> None:
         "baseline (scripted human vs scripted zombies): survived %.1f%%", 100 * baseline.survived
     )
 
+    replay_dir = training_replay_dir()
     batch = env.reset()
     h = algo.actor.initial_state(env.num_envs, device)
     start = torch.ones(env.num_envs, dtype=torch.bool, device=device)
@@ -194,6 +200,23 @@ def main() -> None:
                 100 * ev["eval/caught"],
                 100 * ev["eval/starved"],
             )
+
+        if (
+            replay_dir
+            and cfg.replay_every
+            and (iteration == 1 or iteration % cfg.replay_every == 0)
+        ):
+            n = env_cfg["zombie_count"]
+            recorded = record_training_replays(
+                replay_dir,
+                run_id,
+                iteration,
+                env_cfg,
+                lambda seed: (RecurrentHumanPolicy(algo.actor, 1, device), "policy"),
+                lambda seed, n=n: (ScriptedZombies(env_cfg, 1, n, seed=seed), "scripted"),
+                cfg.replay_episodes,
+            )
+            log.info("replays: %s", ", ".join(f"{r['id']} {r['outcome']}" for r in recorded))
 
         metrics.log(steps, scalars)
         log.info(

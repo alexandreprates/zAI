@@ -3,7 +3,7 @@ import "./style.css";
 import { createMatch, listMatches, listReplays, listRuns, stopMatch, Stream } from "./api";
 import { Charts } from "./charts";
 import { TopDown } from "./topdown";
-import type { Frame, InitFrame, SnapshotFrame } from "./types";
+import type { Frame, InitFrame, ReplaySummary, SnapshotFrame } from "./types";
 
 const SPEEDS = [0.5, 1, 2, 4, 8, 16];
 
@@ -15,6 +15,9 @@ let init: InitFrame | null = null;
 let last: SnapshotFrame | null = null;
 let selected: string | null = null;
 let seeking = false;
+/** Training run whose recorded episodes are shown above the stage/charts. */
+let currentRun: string | null = null;
+let replays: ReplaySummary[] = [];
 
 function formatTime(s: number): string {
   const m = Math.floor(s / 60);
@@ -69,6 +72,8 @@ function showRun(runId: string): void {
   stream?.close();
   stream = null;
   selected = `t:${runId}`;
+  currentRun = runId;
+  renderRunReplays();
   init = last = null;
   showStage(false);
   $("status").textContent = `Training run ${runId}`;
@@ -76,16 +81,52 @@ function showRun(runId: string): void {
   void refreshLists();
 }
 
-function watch(path: string, key: string): void {
+function watch(path: string, key: string, run: string | null = null): void {
   stream?.close();
   charts.hide();
+  currentRun = run;
   showStage(true);
   selected = key;
   init = last = null;
   stream = new Stream(path, onFrame, () => {
     $("status").textContent = "Disconnected";
   });
+  renderRunReplays();
   void refreshLists();
+}
+
+/** Episodes a trainer recorded during `currentRun` (replays with `match_id === run_id`),
+ * one chip per episode in iteration order; clicking one plays it and keeps the strip. */
+function renderRunReplays(): void {
+  const el = $("run-replays");
+  const run = currentRun;
+  const own = run ? replays.filter((r) => r.match_id === run) : [];
+  el.hidden = own.length === 0;
+  if (!run || own.length === 0) {
+    el.replaceChildren();
+    return;
+  }
+  own.sort((a, b) => a.episode - b.episode || a.id.localeCompare(b.id));
+  const label = document.createElement("span");
+  label.className = "label";
+  label.textContent = "Episodes recorded during training";
+  const chips = own.map((r) => {
+    const b = document.createElement("button");
+    const key = `r:${r.id}`;
+    const k = r.id.match(/-e(\d+)$/)?.[1] ?? "0";
+    b.className = `chip ${r.outcome}`;
+    b.classList.toggle("active", selected === key);
+    b.textContent = `it ${r.episode} · #${k} · ${r.outcome}`;
+    b.title = `${r.id}: ${r.human} human vs ${r.zombies} zombies, ${r.length} decisions`;
+    b.onclick = () => watch(`/ws/replay/${r.id}`, key, run);
+    return b;
+  });
+  const back = document.createElement("button");
+  back.className = "chip";
+  back.textContent = "Curves";
+  back.classList.toggle("active", selected === `t:${run}`);
+  back.onclick = () => showRun(run);
+  el.replaceChildren(label, back, ...chips);
 }
 
 let lastLists = "";
@@ -107,11 +148,23 @@ function item(title: string, detail: string, key: string, onOpen: () => void): H
 
 async function refreshLists(): Promise<void> {
   try {
-    const [matches, replays, runs] = await Promise.all([listMatches(), listReplays(), listRuns()]);
+    const [matches, allReplays, runs] = await Promise.all([
+      listMatches(),
+      listReplays(),
+      listRuns(),
+    ]);
     // Re-render only on change, so clicks are not lost to a DOM swap.
-    const signature = JSON.stringify([matches, replays, runs, selected]);
+    const signature = JSON.stringify([matches, allReplays, runs, selected, currentRun]);
     if (signature === lastLists) return;
     lastLists = signature;
+    replays = allReplays;
+    renderRunReplays();
+    // Episodes recorded by trainers are listed under their run, not in the sidebar.
+    const runIds = new Set(runs.map((r) => r.run_id));
+    const perRun = new Map<string, number>();
+    for (const r of allReplays) {
+      if (runIds.has(r.match_id)) perRun.set(r.match_id, (perRun.get(r.match_id) ?? 0) + 1);
+    }
     $("matches").replaceChildren(
       ...matches.map((m) => {
         const key = `m:${m.id}`;
@@ -129,7 +182,7 @@ async function refreshLists(): Promise<void> {
       }),
     );
     $("replays").replaceChildren(
-      ...replays.map((r) => {
+      ...allReplays.filter((r) => !runIds.has(r.match_id)).map((r) => {
         const key = `r:${r.id}`;
         return item(r.id, `${r.outcome} · ${r.length} ticks · ${r.human}/${r.zombies}`, key, () =>
           watch(`/ws/replay/${r.id}`, key),
@@ -138,7 +191,13 @@ async function refreshLists(): Promise<void> {
     );
     $("runs").replaceChildren(
       ...runs.map((r) =>
-        item(r.run_id, `${r.models.join(", ")} · step ${r.last_step.toLocaleString()}`, `t:${r.run_id}`, () =>
+        item(
+          r.run_id,
+          `${r.models.join(", ")} · step ${r.last_step.toLocaleString()}${
+            perRun.has(r.run_id) ? ` · ${perRun.get(r.run_id)} episodes` : ""
+          }`,
+          `t:${r.run_id}`,
+          () =>
           showRun(r.run_id),
         ),
       ),

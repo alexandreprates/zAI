@@ -11,6 +11,8 @@ device: cuda
 eval_every: 10
 eval_episodes: 128
 checkpoint_every: 20
+replay_every: 25
+replay_episodes: 2
 ppo:
   num_envs: 1024
   rollout: 128

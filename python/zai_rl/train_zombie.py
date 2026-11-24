@@ -26,6 +26,7 @@ import numpy as np
 import torch
 import yaml
 
+from arena.export_replays import record_training_replays, training_replay_dir
 from arena.matches import MatchStats, play
 from zai_env.config import deep_merge, load_config
 
@@ -56,6 +57,11 @@ class ZombieTrainConfig:
     baseline_episodes: int = 256  # per zombie count, measured once at startup
     eval_human_checkpoint: str | None = None  # frozen learned human, extra eval opponent
     checkpoint_every: int = 20
+    # At iteration 1 and every `replay_every` iterations (0 disables), record `replay_episodes`
+    # episodes of the current policy into the server replays (needs ZAI_DATA_DIR), same seeds each
+    # time, so the viewer shows how play changes over the run.
+    replay_every: int = 0
+    replay_episodes: int = 2
     mappo: MAPPOConfig = field(default_factory=MAPPOConfig)
 
     @classmethod
@@ -212,6 +218,7 @@ def main() -> None:
         100 * floor["baseline_random/caught"],
     )
 
+    replay_dir = training_replay_dir()
     batch = env.reset()
     h = algo.actor.initial_state(env.num_agents, device)
     start = torch.ones(env.num_agents, dtype=torch.bool, device=device)
@@ -234,6 +241,7 @@ def main() -> None:
         scalars["perf/rollout_s"] = t1 - t0
         scalars["perf/update_s"] = t2 - t1
         scalars["train/reward_mean"] = rollout["rewards"].mean().item()
+        scalars["train/nearest_zombie_m"] = rollout["nearest_zombie_m"].item()
         if ep.returns:
             outcomes = np.array(ep.outcomes)
             scalars["episode/return"] = float(np.mean(ep.returns))
@@ -273,14 +281,32 @@ def main() -> None:
                 ),
             )
 
+        if (
+            replay_dir
+            and cfg.replay_every
+            and (iteration == 1 or iteration % cfg.replay_every == 0)
+        ):
+            n = env_cfg["zombie_count"]
+            recorded = record_training_replays(
+                replay_dir,
+                run_id,
+                iteration,
+                env_cfg,
+                lambda seed: (opponent(env_cfg, 1, seed), cfg.opponent),
+                lambda seed, n=n: (RecurrentZombiePolicy(algo.actor, 1, n, device), "policy"),
+                cfg.replay_episodes,
+            )
+            log.info("replays: %s", ", ".join(f"{r['id']} {r['outcome']}" for r in recorded))
+
         metrics.log(steps, scalars)
         log.info(
-            "it %d steps %d | return %.3f len %.0fs caught %.2f | %.0f steps/s",
+            "it %d steps %d | return %.3f len %.0fs caught %.2f nearest %.0fm | %.0f steps/s",
             iteration,
             steps,
             scalars.get("episode/return", float("nan")),
             scalars.get("episode/length_s", float("nan")),
             scalars.get("episode/caught", float("nan")),
+            scalars["train/nearest_zombie_m"],
             scalars["perf/steps_per_s"],
         )
         if iteration % cfg.checkpoint_every == 0 or steps >= cfg.total_steps:

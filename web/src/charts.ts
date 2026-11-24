@@ -3,9 +3,9 @@ import "uplot/dist/uPlot.min.css";
 
 import { listMetrics } from "./api";
 
-const COLORS = ["#4ea8ff", "#f5c451", "#3ecf8e", "#e5484d"];
+const COLORS = ["#4ea8ff", "#f5c451", "#3ecf8e", "#e5484d", "#b58cff", "#ff8f5c", "#5ce1e6", "#9aa5b1"];
 /** Chart groups shown first; anything else follows alphabetically. */
-const ORDER = ["/eval/", "/episode/", "/train/", "/perf/"];
+const ORDER = ["/eval/", "/eval_vs_learned_human/", "/episode/", "/train/", "/perf/"];
 const AXIS = { stroke: "#8b93a1", grid: { stroke: "#2e3440", width: 1 }, ticks: { stroke: "#2e3440" } };
 
 interface Series {
@@ -20,11 +20,25 @@ interface Chart {
   el: HTMLElement;
 }
 
-/** `model/eval/baseline_x` is drawn on the same chart as `model/eval/x`. */
-function chartKey(model: string, key: string): { chart: string; label: string } {
-  const m = key.match(/^(.*\/)baseline_(.*)$/);
-  if (m) return { chart: `${model}/${m[1]}${m[2]}`, label: "baseline" };
-  return { chart: `${model}/${key}`, label: model };
+/**
+ * Groups related metrics on one chart:
+ * - `eval/baseline_x` is drawn with `eval/x` (label `baseline`);
+ * - `eval/x_lo` / `eval/x_hi` (95% interval bounds) are drawn with `eval/x`;
+ * - `eval/x_z3` (per zombie count) go to one `eval/x by zombie count` chart (label `z3`).
+ */
+export function chartKey(model: string, key: string): { chart: string; label: string } {
+  const m = key.match(/^(.*\/)(baseline_)?(.+?)(_lo|_hi|_z\d+)?$/);
+  if (!m) return { chart: `${model}/${key}`, label: model };
+  const [, dir, baseline, name, suffix] = m;
+  const who = baseline ? "baseline" : model;
+  if (suffix?.startsWith("_z")) {
+    return {
+      chart: `${model}/${dir}${name} by zombie count`,
+      label: `${baseline ? "baseline " : ""}${suffix.slice(1)}`,
+    };
+  }
+  const bound = suffix === "_lo" ? " 95% lo" : suffix === "_hi" ? " 95% hi" : "";
+  return { chart: `${model}/${dir}${name}`, label: `${who}${bound}` };
 }
 
 /** Training curves of one run, live-updated through the metrics SSE stream. */

@@ -13,6 +13,8 @@ eval_every: 10
 eval_episodes: 64
 baseline_episodes: 256
 checkpoint_every: 20
+replay_every: 50
+replay_episodes: 2
 mappo:
   num_envs: 256
   rollout: 128
