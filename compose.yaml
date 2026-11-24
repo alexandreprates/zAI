@@ -34,9 +34,12 @@ services:
       ZAI_SERVER_URL: http://server:8080
       ZAI_CHECKPOINT_DIR: /checkpoints
       ZAI_RUNS_DIR: /runs
+      ZAI_DATA_DIR: /data
     volumes:
       - checkpoints:/checkpoints
       - runs:/runs
+      # Server data: arena.export_replays writes policy replays into /data/replays.
+      - data:/data
     profiles: ["train"]
 
   tensorboard:

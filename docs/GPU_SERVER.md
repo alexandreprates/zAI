@@ -63,6 +63,20 @@ ssh -N \
 Then open http://localhost:8080 ("Training runs") and, after `make tensorboard` on the
 server, http://localhost:6006.
 
+## 5. Watch the trained policy play
+
+Live matches only run the scripted bots, but a checkpoint's episodes can be recorded as
+replays (CPU inference, a few seconds per episode) and watched under "Replays" in the viewer:
+
+```bash
+docker compose up -d --build server
+make export-replays-gpu ARGS="--checkpoint /checkpoints/human/human-s0-gpu1/latest.pt --episodes 10"
+```
+
+The replays are listed as `policy/scripted`. Defaults: the S0 env config, scripted zombies and
+sampled actions; add `--deterministic` for argmax actions or `--zombies random`. Rebuild the
+server first (as above) if it predates policy replays, or it skips those files.
+
 ## What to check in the first hour
 
 - `perf/steps_per_s` (expected tens of thousands; the CPU pilot did ~2.2 k).

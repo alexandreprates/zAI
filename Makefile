@@ -35,6 +35,12 @@ train-human: ## Train the human (M4) in the trainer container; ARGS="--total-ste
 train-human-gpu: ## On the GPU server: human PPO with CUDA (configs/train/human_s0_gpu.yaml); see docs/GPU_SERVER.md
 	$(GPU) --profile train run --rm --build trainer python -m zai_rl.train --config /app/configs/train/human_s0_gpu.yaml $(ARGS)
 
+export-replays: ## Record a human checkpoint's episodes as viewer replays; ARGS="--checkpoint /checkpoints/human/<run>/latest.pt --episodes 10"
+	docker compose --profile train run --rm --build trainer python -m arena.export_replays $(ARGS)
+
+export-replays-gpu: ## On the GPU server: same as export-replays, reusing the CUDA trainer image (inference runs on CPU)
+	$(GPU) --profile train run --rm --build trainer python -m arena.export_replays $(ARGS)
+
 tensorboard: ## TensorBoard on http://localhost:6006 over the runs volume
 	docker compose --profile tensorboard up tensorboard
 

@@ -6,6 +6,25 @@ use serde::{Deserialize, Serialize};
 use zai_sim::bots::BotKind;
 use zai_sim::{Config, Env, HumanAction};
 
+/// Who played one side of a replayed episode: a server bot, or a trained policy whose
+/// episodes were recorded offline (`python -m arena.export_replays`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayAgent {
+    Scripted,
+    Random,
+    Policy,
+}
+
+impl From<BotKind> for ReplayAgent {
+    fn from(kind: BotKind) -> Self {
+        match kind {
+            BotKind::Scripted => Self::Scripted,
+            BotKind::Random => Self::Random,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Replay {
     pub id: String,
@@ -14,8 +33,8 @@ pub struct Replay {
     pub created_at: u64,
     pub config: Config,
     pub seed: u64,
-    pub human: BotKind,
-    pub zombies: BotKind,
+    pub human: ReplayAgent,
+    pub zombies: ReplayAgent,
     /// One entry per decision step: `[movement, interact, zombie_0, .., zombie_{N-1}]`.
     pub actions: Vec<Vec<u8>>,
     pub outcome: String,
@@ -30,8 +49,8 @@ pub struct ReplaySummary {
     pub episode: u32,
     pub created_at: u64,
     pub seed: u64,
-    pub human: BotKind,
-    pub zombies: BotKind,
+    pub human: ReplayAgent,
+    pub zombies: ReplayAgent,
     pub outcome: String,
     pub length: usize,
 }
@@ -165,8 +184,8 @@ mod tests {
             created_at: 0,
             config: cfg,
             seed,
-            human: BotKind::Scripted,
-            zombies: BotKind::Scripted,
+            human: BotKind::Scripted.into(),
+            zombies: BotKind::Scripted.into(),
             actions,
             outcome: crate::frames::outcome_name(env.outcome()).into(),
             final_hash: format!("{:016x}", env.state_hash()),
@@ -190,5 +209,22 @@ mod tests {
         assert!(loaded.verify());
         assert_eq!(store.list().len(), 1);
         assert!(store.load("../etc/passwd").is_none());
+    }
+
+    #[test]
+    fn replays_recorded_by_a_policy_deserialize() {
+        let mut replay = record(
+            Config {
+                episode_cap_s: 10.0,
+                ..Config::default()
+            },
+            3,
+        );
+        replay.human = ReplayAgent::Policy;
+        let json = serde_json::to_value(&replay).unwrap();
+        assert_eq!(json["human"], "policy");
+        let back: Replay = serde_json::from_value(json).unwrap();
+        assert_eq!(back.human, ReplayAgent::Policy);
+        assert!(back.verify());
     }
 }
