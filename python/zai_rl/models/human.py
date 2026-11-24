@@ -7,7 +7,7 @@ from torch.distributions import Categorical
 
 from zai_env.layout import HUMAN
 
-from .encoders import RayEncoder, SetEncoder, mlp
+from .encoders import RayEncoder, SetEncoder, mlp, run_gru_segments
 
 MOVE = zai_sim.MOVE_ACTIONS
 INTERACT = zai_sim.INTERACT_ACTIONS
@@ -104,16 +104,7 @@ class HumanActor(nn.Module):
         """
         B, L, _ = obs.shape
         x = self.encode(obs.reshape(B * L, -1)).reshape(B, L, -1)
-        cuts = (torch.nonzero(starts[:, 1:].any(dim=0)).flatten() + 1).tolist()
-        bounds = [0, *cuts, L]
-        h = h0
-        outs = []
-        for a, b in zip(bounds[:-1], bounds[1:], strict=True):
-            h = h * (~starts[:, a]).unsqueeze(1)
-            out, hn = self.gru(x[:, a:b], h.unsqueeze(0).contiguous())
-            outs.append(out)
-            h = hn[0]
-        out = torch.cat(outs, dim=1).reshape(B * L, -1)
+        out = run_gru_segments(self.gru, x, h0, starts).reshape(B * L, -1)
         return self.heads(out, mask.reshape(B * L, -1))
 
 

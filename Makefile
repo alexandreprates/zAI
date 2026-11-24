@@ -35,6 +35,12 @@ train-human: ## Train the human (M4) in the trainer container; ARGS="--total-ste
 train-human-gpu: ## On the GPU server: human PPO with CUDA (configs/train/human_s0_gpu.yaml); see docs/GPU_SERVER.md
 	$(GPU) --profile train run --rm --build trainer python -m zai_rl.train --config /app/configs/train/human_s0_gpu.yaml $(ARGS)
 
+train-zombie: ## Train the zombies (M5) in the trainer container; ARGS="--total-steps N --run-id ID"
+	docker compose --profile train run --rm --build trainer python -m zai_rl.train_zombie --config /app/configs/train/zombie_s0.yaml $(ARGS)
+
+train-zombie-gpu: ## On the GPU server: zombie MAPPO with CUDA (configs/train/zombie_s0_gpu.yaml)
+	$(GPU) --profile train run --rm --build trainer python -m zai_rl.train_zombie --config /app/configs/train/zombie_s0_gpu.yaml $(ARGS)
+
 export-replays: ## Record a human checkpoint's episodes as viewer replays; ARGS="--checkpoint /checkpoints/human/<run>/latest.pt --episodes 10"
 	docker compose --profile train run --rm --build trainer python -m arena.export_replays $(ARGS)
 

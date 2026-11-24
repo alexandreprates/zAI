@@ -1,5 +1,12 @@
-"""Training environments: several `ZaiVecEnv` groups (one per zombie count) seen by the human
-learner as one batch, with the zombies driven by a fixed opponent policy."""
+"""Training environments: several `ZaiVecEnv` groups (one per zombie count) seen by one learner
+as a single batch, with the other side driven by a fixed opponent policy.
+
+- `HumanTrainingEnv`: the learner is the human (`[E]` rows), zombies are the opponent.
+- `ZombieTrainingEnv`: the learner is the zombie team. Every group has a fixed zombie count, so
+  the zombies of all groups form a flat agent axis `[A]` (`A = sum_g E_g * N_g`) with a static
+  `agent_env [A]` index into the env axis `[E]`; agent `off_g + e * N_g + n` is zombie `n` of
+  env `e` of group `g`.
+"""
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -11,6 +18,17 @@ from zai_env.config import deep_merge
 from zai_env.vec import ZaiVecEnv
 
 ZombieFactory = Callable[[dict[str, Any], int, int, int], Any]
+HumanFactory = Callable[[dict[str, Any], int, int], Any]
+
+
+def group_sizes(num_envs: int, groups: int) -> list[int]:
+    """Envs per group: as equal as possible, summing to `num_envs`."""
+    if num_envs < groups:
+        raise ValueError("num_envs must be at least the number of zombie groups")
+    sizes = [num_envs // groups] * groups
+    for i in range(num_envs - sum(sizes)):
+        sizes[i] += 1
+    return sizes
 
 
 @dataclass
@@ -46,11 +64,7 @@ class HumanTrainingEnv:
         seed: int = 0,
         num_threads: int | None = None,
     ):
-        if num_envs < len(zombie_counts):
-            raise ValueError("num_envs must be at least the number of zombie groups")
-        sizes = [num_envs // len(zombie_counts)] * len(zombie_counts)
-        for i in range(num_envs - sum(sizes)):
-            sizes[i] += 1
+        sizes = group_sizes(num_envs, len(zombie_counts))
         self.groups = []
         for i, (n, size) in enumerate(zip(zombie_counts, sizes, strict=True)):
             cfg = deep_merge(config, {"zombie_count": n})
@@ -91,5 +105,92 @@ class HumanTrainingEnv:
             truncated=cat(lambda p: p.truncated),
             outcome=cat(lambda p: p.outcome),
             episode_length=cat(lambda p: p.episode_length),
+            final_state=cat(lambda p: p.final_state),
+        )
+
+
+@dataclass
+class ZombieBatch:
+    obs: np.ndarray  # [A, ZOMBIE_OBS_DIM]
+    state: np.ndarray  # [E, STATE_DIM]
+
+
+@dataclass
+class ZombieStep:
+    next: ZombieBatch
+    reward: np.ndarray  # [A]
+    terminated: np.ndarray  # [E] bool
+    truncated: np.ndarray  # [E] bool
+    outcome: np.ndarray  # [E] uint8
+    episode_length: np.ndarray  # [E]
+    final_obs: np.ndarray  # [A, ZOMBIE_OBS_DIM], rows valid where the agent's env truncated
+    final_state: np.ndarray  # [E, STATE_DIM], rows valid where truncated
+
+
+class ZombieTrainingEnv:
+    """One vec env per zombie count; the human acts with `human_factory` policies."""
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        zombie_counts: list[int],
+        num_envs: int,
+        human_factory: HumanFactory,
+        seed: int = 0,
+        num_threads: int | None = None,
+    ):
+        sizes = group_sizes(num_envs, len(zombie_counts))
+        self.groups = []
+        agent_env = []
+        env_offset = 0
+        for i, (n, size) in enumerate(zip(zombie_counts, sizes, strict=True)):
+            cfg = deep_merge(config, {"zombie_count": n})
+            venv = ZaiVecEnv(cfg, num_envs=size, seed=seed + 1000 * i, num_threads=num_threads)
+            self.groups.append((venv, human_factory(cfg, size, seed + 1000 * i + 1), n))
+            agent_env.append(np.repeat(np.arange(size) + env_offset, n))
+            env_offset += size
+        self.num_envs = num_envs
+        self.agent_env = np.concatenate(agent_env)
+        self.num_agents = len(self.agent_env)
+        self._human: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def reset(self) -> ZombieBatch:
+        obs = [venv.reset() for venv, _, _ in self.groups]
+        self._human = [(o.human_obs.copy(), o.human_mask.copy()) for o in obs]
+        return ZombieBatch(
+            obs=np.concatenate([o.zombie_obs.reshape(-1, o.zombie_obs.shape[-1]) for o in obs]),
+            state=np.concatenate([o.state for o in obs]),
+        )
+
+    def step(self, zombie_actions: np.ndarray) -> ZombieStep:
+        parts = []
+        start = 0
+        for (venv, human, n), (hobs, hmask) in zip(self.groups, self._human, strict=True):
+            end = start + venv.num_envs * n
+            za = zombie_actions[start:end].reshape(venv.num_envs, n)
+            step = venv.step(human.act(hobs, hmask), za)
+            if hasattr(human, "reset"):
+                human.reset(step.terminated | step.truncated)
+            parts.append(step)
+            start = end
+        self._human = [(p.obs.human_obs.copy(), p.obs.human_mask.copy()) for p in parts]
+
+        def cat(f):
+            return np.concatenate([f(p) for p in parts])
+
+        def flat(x: np.ndarray) -> np.ndarray:
+            return x.reshape(-1, *x.shape[2:])
+
+        return ZombieStep(
+            next=ZombieBatch(
+                obs=cat(lambda p: flat(p.obs.zombie_obs)),
+                state=cat(lambda p: p.obs.state),
+            ),
+            reward=cat(lambda p: p.zombie_reward.reshape(-1)),
+            terminated=cat(lambda p: p.terminated),
+            truncated=cat(lambda p: p.truncated),
+            outcome=cat(lambda p: p.outcome),
+            episode_length=cat(lambda p: p.episode_length),
+            final_obs=cat(lambda p: flat(p.final_zombie_obs)),
             final_state=cat(lambda p: p.final_state),
         )

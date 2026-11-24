@@ -1,0 +1,31 @@
+# M5 on the GPU server (Tesla P100, 24 CPU cores): same algorithm and stage as zombie_s0.yaml,
+# sized up like human_s0_gpu.yaml. 1024 envs with 2/3/4 zombies are ~3072 zombie agents, so a
+# 128-step rollout holds ~393 k agent transitions. The frozen M4 human is an extra eval opponent.
+env_config: configs/env/s0.yaml
+zombie_counts: [2, 3, 4]
+opponent: scripted
+total_steps: 200000000
+seed: 0
+num_threads: 20
+torch_threads: 4
+device: cuda
+eval_every: 10
+eval_episodes: 128
+baseline_episodes: 256
+eval_human_checkpoint: /checkpoints/human/human-s0-gpu1/latest.pt
+checkpoint_every: 20
+mappo:
+  num_envs: 1024
+  rollout: 128
+  bptt: 64
+  epochs: 3
+  minibatches: 8
+  lr: 0.0003
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip: 0.2
+  ent_start: 0.01
+  ent_end: 0.001
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  hidden: 128

@@ -50,3 +50,23 @@ class RayEncoder(nn.Module):
         # rays: [B, R, C] -> conv over R
         h = self.conv(rays.transpose(1, 2))
         return self.proj(h.flatten(1))
+
+
+def run_gru_segments(
+    gru: nn.GRU, x: torch.Tensor, h0: torch.Tensor, starts: torch.Tensor
+) -> torch.Tensor:
+    """Runs `gru` over `x [B, L, F]` from `h0 [B, H]`, clearing the memory of row `b` at
+    every `starts[b, t]` (first decision of an episode). The GRU runs once per segment
+    between time steps where any row restarts, which is equivalent to stepping one decision
+    at a time. Returns the outputs `[B, L, H]`."""
+    L = x.shape[1]
+    cuts = (torch.nonzero(starts[:, 1:].any(dim=0)).flatten() + 1).tolist()
+    bounds = [0, *cuts, L]
+    h = h0
+    outs = []
+    for a, b in zip(bounds[:-1], bounds[1:], strict=True):
+        h = h * (~starts[:, a]).unsqueeze(1)
+        out, hn = gru(x[:, a:b], h.unsqueeze(0).contiguous())
+        outs.append(out)
+        h = hn[0]
+    return torch.cat(outs, dim=1)

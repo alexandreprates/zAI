@@ -1,0 +1,30 @@
+# M5: zombie recurrent MAPPO vs the scripted human on curriculum stage S0
+# (docs/ARCHITECTURE.md section 4.6). Sized for the CPU pilot; the GPU run uses
+# zombie_s0_gpu.yaml. total_steps counts env steps (one decision of a whole match).
+env_config: configs/env/s0.yaml
+zombie_counts: [2, 3, 4]
+opponent: scripted
+total_steps: 10000000
+seed: 0
+num_threads: 4
+torch_threads: 4
+device: auto
+eval_every: 10
+eval_episodes: 64
+baseline_episodes: 256
+checkpoint_every: 20
+mappo:
+  num_envs: 256
+  rollout: 128
+  bptt: 64
+  epochs: 3
+  minibatches: 8
+  lr: 0.0003
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip: 0.2
+  ent_start: 0.01
+  ent_end: 0.001
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  hidden: 128

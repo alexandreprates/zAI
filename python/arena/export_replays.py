@@ -1,4 +1,4 @@
-"""Records episodes of a trained human checkpoint as server replays.
+"""Records episodes of trained checkpoints (human, zombies or both) as server replays.
 
 Live server matches only run the Rust bots until the gRPC agent API lands (M7). Replays,
 however, are just `(config, seed, action log)` re-simulated by the server, so episodes played
@@ -6,6 +6,9 @@ here with the Python policy can be written into the server's `replays/` director
 in the viewer like any other replay.
 
     python -m arena.export_replays --checkpoint /checkpoints/human/<run>/latest.pt --episodes 10
+    python -m arena.export_replays --zombie-checkpoint /checkpoints/zombie/<run>/latest.pt
+
+A side without a checkpoint is played by a bot (`--human` / `--zombies`, scripted by default).
 """
 
 import argparse
@@ -23,8 +26,8 @@ import zai_sim
 
 from zai_env.config import load_config
 from zai_env.vec import OUTCOMES
-from zai_rl.bots import RandomZombies, ScriptedZombies
-from zai_rl.policy import RecurrentHumanPolicy
+from zai_rl.bots import RandomHuman, RandomZombies, ScriptedHuman, ScriptedZombies
+from zai_rl.policy import RecurrentHumanPolicy, RecurrentZombiePolicy
 from zai_rl.train import resolve
 
 log = logging.getLogger(__name__)
@@ -69,46 +72,81 @@ def default_out_dir() -> Path:
     return Path(os.environ.get("ZAI_DATA_DIR", "/data")) / "replays"
 
 
+def checkpoint_name(path: Path) -> str:
+    return f"{path.parent.name}-{path.stem}"
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Record a human checkpoint's episodes as replays.")
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser = argparse.ArgumentParser(description="Record checkpoint episodes as viewer replays.")
+    parser.add_argument(
+        "--checkpoint", "--human-checkpoint", dest="human_checkpoint", type=Path, default=None
+    )
+    parser.add_argument("--zombie-checkpoint", type=Path, default=None)
     parser.add_argument("--env-config", default="configs/env/s0.yaml")
+    parser.add_argument("--zombie-count", type=int, help="override the env config's count")
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument("--human", choices=["scripted", "random"], default="scripted")
     parser.add_argument("--zombies", choices=["scripted", "random"], default="scripted")
     parser.add_argument("--deterministic", action="store_true", help="argmax actions")
-    parser.add_argument("--name", help="match id shown in the viewer (default: <run>-<ckpt>)")
+    parser.add_argument("--name", help="match id shown in the viewer (default: from checkpoints)")
     parser.add_argument("--out-dir", type=Path, default=None, help="default: $ZAI_DATA_DIR/replays")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if args.human_checkpoint is None and args.zombie_checkpoint is None:
+        parser.error("give --checkpoint (human) and/or --zombie-checkpoint")
 
     torch.set_num_threads(1)
-    config = load_config(resolve(args.env_config), env_overrides=False)
-    policy = RecurrentHumanPolicy.from_checkpoint(
-        args.checkpoint, num_envs=1, deterministic=args.deterministic
+    overrides = {"zombie_count": args.zombie_count} if args.zombie_count else None
+    config = load_config(resolve(args.env_config), overrides, env_overrides=False)
+    n = config["zombie_count"]
+    human_policy = (
+        RecurrentHumanPolicy.from_checkpoint(
+            args.human_checkpoint, num_envs=1, deterministic=args.deterministic
+        )
+        if args.human_checkpoint
+        else None
+    )
+    zombie_policy = (
+        RecurrentZombiePolicy.from_checkpoint(
+            args.zombie_checkpoint, num_envs=1, num_zombies=n, deterministic=args.deterministic
+        )
+        if args.zombie_checkpoint
+        else None
     )
     torch.manual_seed(args.seed)
-    name = replay_id_prefix(args.name or f"{args.checkpoint.parent.name}-{args.checkpoint.stem}")
+    parts = [checkpoint_name(p) for p in (args.human_checkpoint, args.zombie_checkpoint) if p]
+    name = replay_id_prefix(args.name or "-vs-".join(parts))
     out_dir = args.out_dir or default_out_dir()
+    human_kind = "policy" if human_policy else args.human
+    zombie_kind = "policy" if zombie_policy else args.zombies
 
     counts = dict.fromkeys(OUTCOMES[1:], 0)
     for ep in range(args.episodes):
         seed = zai_sim.episode_seed(args.seed, 0, ep)
-        policy.reset(np.ones(1, dtype=bool))
-        n = config["zombie_count"]
-        zombies = (
-            ScriptedZombies(config, 1, n, seed=seed)
-            if args.zombies == "scripted"
-            else RandomZombies(1, n, seed=seed)
-        )
-        episode = record_episode(config, seed, policy, zombies)
+        fresh = np.ones(1, dtype=bool)
+        if human_policy:
+            human_policy.reset(fresh)
+            human = human_policy
+        elif args.human == "scripted":
+            human = ScriptedHuman(config, 1, seed=seed)
+        else:
+            human = RandomHuman(1, seed=seed)
+        if zombie_policy:
+            zombie_policy.reset(fresh)
+            zombies = zombie_policy
+        elif args.zombies == "scripted":
+            zombies = ScriptedZombies(config, 1, n, seed=seed)
+        else:
+            zombies = RandomZombies(1, n, seed=seed)
+        episode = record_episode(config, seed, human, zombies)
         replay = {
             "id": f"{name}-e{ep}",
             "match_id": name,
             "episode": ep,
             "created_at": int(time.time()),
-            "human": "policy",
-            "zombies": args.zombies,
+            "human": human_kind,
+            "zombies": zombie_kind,
             **episode,
         }
         path = write_replay(out_dir, replay)
