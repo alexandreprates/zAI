@@ -90,10 +90,20 @@ def models_dir() -> Path | None:
 
 
 def stage_name(config: dict[str, Any]) -> str:
-    """Name of the env config file in `configs/env` equal to `config` (`custom` if none)."""
+    """Name of the env config file in `configs/env` with the same map and rules as `config`
+    (`custom` if none). Rewards are ignored (they do not change a match), and keys added to
+    the config after the model was trained take their defaults."""
+
+    def rules(c: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in c.items() if k != "reward"}
+
+    try:
+        target = rules(load_config(overrides=config, env_overrides=False))
+    except ValueError:
+        return "custom"
     for path in sorted(config_dir().glob("*.yaml")):
         try:
-            if load_config(path, env_overrides=False) == config:
+            if rules(load_config(path, env_overrides=False)) == target:
                 return path.stem
         except ValueError:
             continue

@@ -44,6 +44,11 @@ def test_stage_is_the_matching_env_config_file():
     )
     cfg = load_config(config_dir() / "s0.yaml", overrides={"food_count": 7}, env_overrides=False)
     assert stage_name(cfg) == "custom"
+    # Rewards do not change the map, and configs saved before a key existed get its default.
+    old = load_config(config_dir() / "s0.yaml", env_overrides=False)
+    old["reward"]["zombie_step_penalty"] = 0.123
+    del old["food_near_spawn_count"]
+    assert stage_name(old) == "s0"
 
 
 def test_checkpoint_exports_onnx_with_metadata(tmp_path):
