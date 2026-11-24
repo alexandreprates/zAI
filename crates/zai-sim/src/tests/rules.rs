@@ -553,3 +553,44 @@ fn zombie_rewards_equal_the_team_reward_without_shaping() {
     let r = env.step(IDLE, &stay(&env));
     assert_eq!(env.zombie_rewards(), &[r.zombie_reward; 3]);
 }
+
+#[test]
+fn food_near_spawn_is_placed_around_the_human() {
+    let mut cfg = Config {
+        map_size_m: 75.0,
+        house_count: 3,
+        food_count: 50,
+        food_near_spawn_count: 3,
+        food_near_spawn_radius_m: 15.0,
+        min_spawn_distance_m: 25.0,
+        ..Config::default()
+    };
+    cfg.food_inside_house_fraction = 0.05;
+    for seed in 0..20 {
+        let env = Env::new(cfg.clone(), seed).unwrap();
+        let inside = (0.05f32 * 50.0).ceil() as usize;
+        let near = &env.food[inside..inside + 3];
+        for f in near {
+            assert!(
+                f.pos.distance(env.human.pos) <= 15.0 + 1e-3,
+                "seed {seed}: {:?} vs human {:?}",
+                f.pos,
+                env.human.pos
+            );
+        }
+    }
+    cfg.food_near_spawn_count = 51;
+    assert!(Env::new(cfg, 0).is_err());
+}
+
+#[test]
+fn food_near_spawn_disabled_keeps_the_generated_map() {
+    let base = Config::default();
+    let same = Config {
+        food_near_spawn_radius_m: 40.0,
+        ..Config::default()
+    };
+    let a = Env::new(base, 3).unwrap();
+    let b = Env::new(same, 3).unwrap();
+    assert_eq!(a.state_hash(), b.state_hash());
+}

@@ -1,0 +1,18 @@
+# Warm-up stage before S0 for zombie training (docs/ARCHITECTURE.md section 4.6): half the S0
+# map, more food and a few packages next to the human's spawn, so the human picks food early
+# (pickup noise reaches 100 m, the whole map) and zombies start within shaping range.
+# Merged over the defaults (configs/env/default.yaml), like s0.yaml.
+map_size_m: 75.0
+house_count: 3
+zombie_count: 3
+food_count: 50
+food_near_spawn_count: 3
+food_near_spawn_radius_m: 15.0
+episode_cap_s: 300.0
+min_spawn_distance_m: 25.0
+reward:
+  # Potential-based food shaping (reserve + proximity, see Env::human_potential).
+  human_food_shaping: 1.0
+  # Per-zombie distance potential 0.5 * (1 - min(d, 100) / 100) (see Env::zombie_potentials).
+  zombie_distance_shaping: 0.5
+  zombie_step_penalty: 0.0

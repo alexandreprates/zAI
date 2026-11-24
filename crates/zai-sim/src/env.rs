@@ -219,10 +219,15 @@ impl Env {
         } else {
             (cfg.food_inside_house_fraction * cfg.food_count as f32).ceil() as usize
         };
+        // Order: packages inside houses, then near the human's spawn, then anywhere. Nothing
+        // changes (including the RNG stream) when `food_near_spawn_count` is 0.
+        let near_end = (inside + cfg.food_near_spawn_count).min(cfg.food_count);
         let food = (0..cfg.food_count)
             .map(|i| Food {
                 pos: if i < inside {
                     position_inside_house(&map, &mut rng, r)
+                } else if i < near_end {
+                    position_near(&map, &mut rng, r, human_pos, cfg.food_near_spawn_radius_m)
                 } else {
                     food_position(&map, &mut rng, r)
                 },
@@ -818,6 +823,21 @@ fn food_position(map: &Map, rng: &mut impl Rng, margin: f32) -> Vec2 {
         }
     }
     p
+}
+
+/// Uniform position in the disk of `radius` around `center`, inside the map and away from
+/// walls (falls back to any food position if the disk has no free spot).
+fn position_near(map: &Map, rng: &mut impl Rng, margin: f32, center: Vec2, radius: f32) -> Vec2 {
+    for _ in 0..1000 {
+        let d = radius * rng.random::<f32>().sqrt();
+        let a = rng.random_range(0.0..TAU);
+        let p = center + d * Vec2::new(a.cos(), a.sin());
+        let inside_map = p.min_element() >= margin && p.max_element() <= map.size - margin;
+        if inside_map && map.clearance(p, margin) >= margin {
+            return p;
+        }
+    }
+    food_position(map, rng, margin)
 }
 
 fn position_inside_house(map: &Map, rng: &mut impl Rng, margin: f32) -> Vec2 {

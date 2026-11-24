@@ -14,6 +14,8 @@ entity_radius_m: 0.3
 pickup_range_m: 1.5
 door_range_m: 2.0
 food_inside_house_fraction: 0.05
+food_near_spawn_count: 0
+food_near_spawn_radius_m: 15.0
 
 human:
   vision_radius_m: 100.0

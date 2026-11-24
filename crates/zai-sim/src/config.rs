@@ -28,6 +28,10 @@ pub struct Config {
     pub door_range_m: f32,
     /// Minimum fraction of the initial food placed inside houses.
     pub food_inside_house_fraction: f32,
+    /// Initial food packages placed within `food_near_spawn_radius_m` of the human's spawn
+    /// (curriculum aid: an early pickup makes the human audible; 0 disables it).
+    pub food_near_spawn_count: usize,
+    pub food_near_spawn_radius_m: f32,
     pub human: HumanConfig,
     pub zombie: ZombieConfig,
     pub noise: NoiseConfig,
@@ -125,6 +129,8 @@ impl Default for Config {
             pickup_range_m: 1.5,
             door_range_m: 2.0,
             food_inside_house_fraction: 0.05,
+            food_near_spawn_count: 0,
+            food_near_spawn_radius_m: 15.0,
             human: HumanConfig::default(),
             zombie: ZombieConfig::default(),
             noise: NoiseConfig::default(),
@@ -247,6 +253,12 @@ impl Config {
         }
         if !(self.human.vision_fov_deg > 0.0 && self.human.vision_fov_deg <= 360.0) {
             return err("human.vision_fov_deg must be in (0, 360]".into());
+        }
+        if self.food_near_spawn_count > self.food_count {
+            return err("food_near_spawn_count must be <= food_count".into());
+        }
+        if self.food_near_spawn_radius_m <= 0.0 {
+            return err("food_near_spawn_radius_m must be positive".into());
         }
         if self.reward.zombie_distance_shaping_range_m <= 0.0 {
             return err("reward.zombie_distance_shaping_range_m must be positive".into());
