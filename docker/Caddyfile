@@ -1,0 +1,17 @@
+# HTTPS proxy in front of zai-server (compose.tls.yaml). Certificates come from Caddy's own
+# local CA (`tls internal`), so no public DNS or ACME challenge is needed; the root
+# certificate to trust is in the caddy-data volume at /data/caddy/pki/authorities/local/root.crt.
+# Site addresses come from ZAI_TLS_SITES (comma-separated host:port list).
+{
+	admin off
+	auto_https disable_redirects
+	skip_install_trust
+}
+
+{$ZAI_TLS_SITES:localhost:8080} {
+	tls internal
+	# WebSockets (/ws/...) and SSE (/api/metrics/stream) pass through reverse_proxy as is.
+	reverse_proxy server:8080 {
+		flush_interval -1
+	}
+}

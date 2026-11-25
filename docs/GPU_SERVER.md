@@ -89,6 +89,24 @@ The replays are listed as `policy/scripted`. Defaults: the S0 env config, script
 sampled actions; add `--deterministic` for argmax actions or `--zombies random`. Rebuild the
 server first (as above) if it predates policy replays, or it skips those files.
 
+## 6. HTTPS with self-signed certificates (optional)
+
+`compose.tls.yaml` puts Caddy (`docker/Caddyfile`) in front of the server: Caddy takes the
+published port 8080 and serves HTTPS with certificates from its own local CA (`tls internal`),
+so it needs no public DNS record or ACME challenge. The server is no longer published and stays
+reachable as `http://server:8080` inside the compose network, where trainers post metrics.
+
+```bash
+ZAI_TLS_SITES="zai.example.com:8080, gpu-server.lan:8080" \
+  docker compose -f compose.yaml -f compose.tls.yaml up -d server proxy
+```
+
+Only the listed host names get a certificate (browsing by IP fails the TLS handshake), and
+clients must resolve them to the server's LAN address. Browsers warn until Caddy's root CA is
+trusted; copy it with `docker compose -f compose.yaml -f compose.tls.yaml cp
+proxy:/data/caddy/pki/authorities/local/root.crt .` and import it into the client's trust store.
+Going back to plain HTTP: `docker compose stop proxy && docker compose up -d server`.
+
 ## What to check in the first hour
 
 - `perf/steps_per_s` (expected tens of thousands; the CPU pilot did ~2.2 k).

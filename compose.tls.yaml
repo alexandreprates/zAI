@@ -1,0 +1,27 @@
+# HTTPS in front of the server with Caddy and self-signed certificates (Caddy's local CA):
+#
+#   ZAI_TLS_SITES="zai.example.com:8080, gpu-server.lan:8080" \
+#     docker compose -f compose.yaml -f compose.tls.yaml up -d server proxy
+#
+# Caddy takes over the published port 8080; the server stays reachable as http://server:8080
+# inside the compose network (trainers post metrics there).
+services:
+  server:
+    ports: !reset []
+
+  proxy:
+    image: caddy:2.10.2-alpine
+    depends_on: [server]
+    ports:
+      - "8080:8080"
+    environment:
+      ZAI_TLS_SITES: ${ZAI_TLS_SITES:-localhost:8080}
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+volumes:
+  caddy-data:
+  caddy-config:
