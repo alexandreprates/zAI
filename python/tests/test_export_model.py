@@ -49,6 +49,15 @@ def test_stage_is_the_matching_env_config_file():
     old["reward"]["zombie_step_penalty"] = 0.123
     del old["food_near_spawn_count"]
     assert stage_name(old) == "s0"
+    # Trainers export with the largest trained zombie count, not the file's.
+    assert (
+        stage_name(
+            load_config(
+                config_dir() / "s0_small.yaml", overrides={"zombie_count": 10}, env_overrides=False
+            )
+        )
+        == "s0_small"
+    )
 
 
 def test_checkpoint_exports_onnx_with_metadata(tmp_path):

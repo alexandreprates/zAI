@@ -150,6 +150,9 @@ def main() -> None:
     # live matches and full-spec runs, not to these stages.
     env_cfg = load_config(resolve(cfg.env_config), env_overrides=False)
     decision_s = env_cfg["dt_s"] * env_cfg["action_repeat"]
+    # Replays and exported models use the largest trained zombie count: the env config file's
+    # own `zombie_count` may not be one of the trained counts.
+    show_cfg = deep_merge(env_cfg, {"zombie_count": max(cfg.zombie_counts)})
     opponent = zombie_opponent(cfg, device)
     env = HumanTrainingEnv(
         env_cfg,
@@ -259,15 +262,15 @@ def main() -> None:
             and cfg.replay_every
             and (iteration == 1 or iteration % cfg.replay_every == 0)
         ):
-            n = env_cfg["zombie_count"]
+            n = show_cfg["zombie_count"]
             recorded = record_training_replays(
                 replay_dir,
                 run_id,
                 iteration,
-                env_cfg,
+                show_cfg,
                 lambda seed: (RecurrentHumanPolicy(algo.actor, 1, device), "policy"),
                 lambda seed, n=n: (
-                    opponent(deep_merge(env_cfg, {"zombie_count": n}), 1, n, seed),
+                    opponent(show_cfg, 1, n, seed),
                     "scripted" if cfg.opponent == "scripted" else "policy",
                 ),
                 cfg.replay_episodes,
@@ -294,7 +297,7 @@ def main() -> None:
             save_checkpoint(ckpt_dir / f"it{iteration:06d}.pt", algo, extra)
             save_checkpoint(ckpt_dir / "latest.pt", algo, extra)
             # Live matches in the viewer play the latest exported model of each run.
-            export_training_model(algo.actor, run_id, env_cfg, iteration, steps)
+            export_training_model(algo.actor, run_id, show_cfg, iteration, steps)
 
     metrics.close()
     log.info("done: %d steps in %.0f s", steps, time.time() - started)

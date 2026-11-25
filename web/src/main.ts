@@ -324,9 +324,14 @@ function setupControls(): void {
   form.onsubmit = async (ev) => {
     ev.preventDefault();
     const data = new FormData(form);
-    // A stage is the full env config of a training run; count fields override it.
+    // A stage is the full env config of a training run (preferably the selected model's, so
+    // its zombie count carries over); count fields override it.
     const stage = String(data.get("stage") ?? "");
-    const base = models.find((m) => m.stage === stage && stage !== "")?.config ?? {};
+    const picked = [selectedModel("zombies"), selectedModel("human")].find(
+      (m) => m !== undefined && m.stage === stage,
+    );
+    const base =
+      (picked ?? models.find((m) => m.stage === stage && stage !== ""))?.config ?? {};
     const config: Record<string, unknown> = { ...base };
     for (const key of ["zombie_count", "food_count"]) {
       const v = String(data.get(key) ?? "");
