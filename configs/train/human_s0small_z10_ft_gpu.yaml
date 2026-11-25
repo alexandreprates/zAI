@@ -1,0 +1,34 @@
+# Second human fine-tune on the GPU server: continues from human-s0small-ft1 (the M4 human
+# fine-tuned against the frozen M5 zombies, ~95-100% survival with 2-4 zombies) on s0_small
+# with 10 zombies, so the human has to learn to flee a crowd instead of dodging a few.
+# The zombie policy is shared per agent, so it plays any zombie count.
+env_config: configs/env/s0_small.yaml
+zombie_counts: [10]
+opponent: policy
+zombie_checkpoint: /checkpoints/zombie/zombie-s0small-gpu1/latest.pt
+init_checkpoint: /checkpoints/human/human-s0small-ft1/final.pt
+total_steps: 100000000
+seed: 1
+num_threads: 20
+torch_threads: 4
+device: cuda
+eval_every: 20
+eval_episodes: 128
+checkpoint_every: 20
+replay_every: 25
+replay_episodes: 2
+ppo:
+  num_envs: 1024
+  rollout: 128
+  bptt: 64
+  epochs: 4
+  minibatches: 8
+  lr: 0.0001
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip: 0.2
+  ent_start: 0.005
+  ent_end: 0.001
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  hidden: 256
