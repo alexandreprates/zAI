@@ -1,4 +1,4 @@
-"""Zombie training entrypoint (M5): recurrent MAPPO against a fixed human bot.
+"""Zombie training entrypoint (M5): recurrent MAPPO against a fixed human (bot or frozen policy).
 
     python -m zai_rl.train_zombie --config configs/train/zombie_s0.yaml [--total-steps N]
 
@@ -11,6 +11,10 @@ Evaluation plays each zombie count separately on fixed seeds and reports the cat
 count and pooled, with a Wilson 95% interval, next to the scripted-zombie baseline measured at
 startup on the same seeds (M5 acceptance: pooled catch rate above the baseline with
 non-overlapping intervals, docs/ARCHITECTURE.md section 4.6).
+
+`opponent: policy` trains against a frozen learned human (`human_checkpoint`), and
+`init_checkpoint` starts from a trained zombie team's weights (fine-tuning: fresh optimizer and
+counters, unlike `--resume`).
 """
 
 import argparse
@@ -47,7 +51,10 @@ class ZombieTrainConfig:
     run_id: str | None = None
     env_config: str = "configs/env/s0.yaml"
     zombie_counts: list[int] = field(default_factory=lambda: [2, 3, 4])
-    opponent: str = "scripted"  # human bot used for training: scripted | random
+    # Human used for training: scripted | random bots, or a frozen `policy` (`human_checkpoint`).
+    opponent: str = "scripted"
+    human_checkpoint: str | None = None
+    init_checkpoint: str | None = None  # trained zombie checkpoint to fine-tune
     total_steps: int = 20_000_000
     seed: int = 0
     num_threads: int | None = None
@@ -75,8 +82,11 @@ class ZombieTrainConfig:
         unknown = set(raw) - {f.name for f in fields(cls)}
         if unknown:
             raise ValueError(f"unknown train config keys: {sorted(unknown)}")
-        if raw.get("opponent", "scripted") not in ("scripted", "random"):
-            raise ValueError("opponent must be 'scripted' or 'random'")
+        opponent = raw.get("opponent", "scripted")
+        if opponent not in ("scripted", "random", "policy"):
+            raise ValueError("opponent must be 'scripted', 'random' or 'policy'")
+        if opponent == "policy" and not raw.get("human_checkpoint"):
+            raise ValueError("opponent 'policy' needs a human_checkpoint")
         mappo = MAPPOConfig(**raw.pop("mappo", {}))
         return cls(**raw, mappo=mappo)
 
@@ -85,6 +95,19 @@ def human_bot(kind: str) -> HumanFactory:
     if kind == "random":
         return lambda c, e, s: RandomHuman(e, seed=s)
     return lambda c, e, s: ScriptedHuman(c, e, seed=s)
+
+
+def frozen_human(path: Path, device: torch.device) -> HumanFactory:
+    """Factory of recurrent policies sharing one frozen human actor loaded from `path`."""
+    actor = RecurrentHumanPolicy.from_checkpoint(path, num_envs=1, device=str(device)).actor
+    return lambda c, e, s: RecurrentHumanPolicy(actor, e, device)
+
+
+def human_opponent(cfg: "ZombieTrainConfig", device: torch.device) -> HumanFactory:
+    if cfg.opponent == "policy":
+        assert cfg.human_checkpoint
+        return frozen_human(resolve(cfg.human_checkpoint), device)
+    return human_bot(cfg.opponent)
 
 
 def wilson(p: float, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -151,16 +174,23 @@ def main() -> None:
 
     env_cfg = load_config(resolve(cfg.env_config), env_overrides=False)
     decision_s = env_cfg["dt_s"] * env_cfg["action_repeat"]
+    opponent = human_opponent(cfg, device)
     env = ZombieTrainingEnv(
         env_cfg,
         cfg.zombie_counts,
         cfg.mappo.num_envs,
-        human_bot(cfg.opponent),
+        opponent,
         seed=cfg.seed,
         num_threads=cfg.num_threads,
     )
     algo = ZombieMAPPO(cfg.mappo, device)
     iteration, steps = 0, 0
+    if cfg.init_checkpoint and not args.resume:
+        sd = torch.load(resolve(cfg.init_checkpoint), map_location=device, weights_only=False)
+        algo.actor.load_state_dict(sd["actor"])
+        algo.critic.load_state_dict(sd["critic"])
+        algo.value_rms.load_state_dict(sd["value_rms"])
+        log.info("initialized from %s (%s steps)", cfg.init_checkpoint, sd.get("steps"))
     if args.resume:
         sd = torch.load(args.resume, map_location=device, weights_only=False)
         algo.load_state_dict(sd)
@@ -186,15 +216,32 @@ def main() -> None:
     )
 
     eval_seed = cfg.seed + 777
-    opponent = human_bot(cfg.opponent)
     evals: list[tuple[str, HumanFactory]] = [("eval", opponent)]
+    if cfg.opponent == "policy":
+        # Tracks whether the team forgets how to catch the scripted human.
+        evals.append(("eval_scripted", human_bot("scripted")))
     if cfg.eval_human_checkpoint:
-        frozen = RecurrentHumanPolicy.from_checkpoint(
-            resolve(cfg.eval_human_checkpoint), num_envs=1, device=str(device)
-        ).actor
         evals.append(
-            ("eval_vs_learned_human", lambda c, e, s: RecurrentHumanPolicy(frozen, e, device))
+            ("eval_vs_learned_human", frozen_human(resolve(cfg.eval_human_checkpoint), device))
         )
+
+    def evaluate_all() -> dict[str, float]:
+        out: dict[str, float] = {}
+        for prefix, human in evals:
+            out.update(
+                catch_rates(
+                    env_cfg,
+                    cfg.zombie_counts,
+                    human,
+                    learned_zombies(algo),
+                    cfg.eval_episodes,
+                    eval_seed,
+                    prefix,
+                )
+            )
+        out["eval/baseline_caught"] = baseline["baseline/caught"]
+        out["eval/baseline_caught_hi"] = baseline["baseline/caught_hi"]
+        return out
 
     def measure(prefix: str, zombies: ZombieFactory, episodes: int) -> dict[str, float]:
         return catch_rates(
@@ -218,6 +265,15 @@ def main() -> None:
         ),
         100 * floor["baseline_random/caught"],
     )
+    if iteration == 0 and cfg.init_checkpoint:
+        # The starting point of a fine-tune, at step 0 of the eval curves.
+        ev = evaluate_all()
+        metrics.log(0, ev)
+        log.info(
+            "initial eval: caught %.1f%% (%s)",
+            100 * ev["eval/caught"],
+            ", ".join(f"z{n} {100 * ev[f'eval/caught_z{n}']:.1f}%" for n in cfg.zombie_counts),
+        )
 
     replay_dir = training_replay_dir()
     batch = env.reset()
@@ -252,20 +308,7 @@ def main() -> None:
                 scalars[f"episode/{name}"] = float((outcomes == code).mean())
 
         if iteration % cfg.eval_every == 0:
-            for prefix, human in evals:
-                scalars.update(
-                    catch_rates(
-                        env_cfg,
-                        cfg.zombie_counts,
-                        human,
-                        learned_zombies(algo),
-                        cfg.eval_episodes,
-                        eval_seed,
-                        prefix,
-                    )
-                )
-            scalars["eval/baseline_caught"] = baseline["baseline/caught"]
-            scalars["eval/baseline_caught_hi"] = baseline["baseline/caught_hi"]
+            scalars.update(evaluate_all())
             log.info(
                 "eval: caught %.1f%% [%.1f, %.1f] (baseline %.1f%% [%.1f, %.1f]), starved %.1f%%%s",
                 100 * scalars["eval/caught"],
@@ -275,10 +318,13 @@ def main() -> None:
                 100 * baseline["baseline/caught_lo"],
                 100 * baseline["baseline/caught_hi"],
                 100 * scalars["eval/starved"],
-                (
-                    f"; vs learned human {100 * scalars['eval_vs_learned_human/caught']:.1f}%"
-                    if "eval_vs_learned_human/caught" in scalars
-                    else ""
+                "".join(
+                    f"; {name} {100 * scalars[f'{prefix}/caught']:.1f}%"
+                    for prefix, name in (
+                        ("eval_scripted", "vs scripted human"),
+                        ("eval_vs_learned_human", "vs learned human"),
+                    )
+                    if f"{prefix}/caught" in scalars
                 ),
             )
 
