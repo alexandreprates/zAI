@@ -87,7 +87,11 @@ class HumanTrainingEnv:
         start = 0
         for (venv, zombies), zobs in zip(self.groups, self._zombie_obs, strict=True):
             end = start + venv.num_envs
-            parts.append(venv.step(human_actions[start:end], zombies.act(zobs)))
+            step = venv.step(human_actions[start:end], zombies.act(zobs))
+            # Recurrent opponents (trained zombie policies) clear the memory of finished envs.
+            if hasattr(zombies, "reset"):
+                zombies.reset(step.terminated | step.truncated)
+            parts.append(step)
             start = end
         self._zombie_obs = [p.obs.zombie_obs for p in parts]
 

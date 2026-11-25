@@ -2,6 +2,10 @@
 
     python -m zai_rl.train --config configs/train/human_s0.yaml [--total-steps N] [--run-id ID]
 
+With `opponent: policy` the zombies are a frozen trained policy (`zombie_checkpoint`), and
+`init_checkpoint` starts from a trained human's weights (fine-tuning: fresh optimizer and
+counters, unlike `--resume`).
+
 Metrics go to stdout, TensorBoard (`ZAI_RUNS_DIR`, default ./runs) and, when `ZAI_SERVER_URL`
 is set, to the zai-server metrics API (visible in the viewer). Checkpoints are written to
 `ZAI_CHECKPOINT_DIR` (default ./checkpoints) under `human/<run_id>/`.
@@ -22,13 +26,13 @@ import yaml
 from arena.export_model import export_training_model
 from arena.export_replays import record_training_replays, training_replay_dir
 from arena.matches import play
-from zai_env.config import load_config
+from zai_env.config import deep_merge, load_config
 
 from .algos.ppo_human import EpisodeStats, HumanPPO, PPOConfig, save_checkpoint
 from .bots import ScriptedHuman, ScriptedZombies
 from .envs import HumanTrainingEnv
 from .metrics import MetricsLogger
-from .policy import RecurrentHumanPolicy
+from .policy import RecurrentHumanPolicy, RecurrentZombiePolicy
 
 log = logging.getLogger("zai_rl.train")
 REPO = Path(__file__).resolve().parents[2]
@@ -40,6 +44,11 @@ class TrainConfig:
     run_id: str | None = None
     env_config: str = "configs/env/s0.yaml"
     zombie_counts: list[int] = field(default_factory=lambda: [2, 3, 4])
+    # Zombie opponent: `scripted` bots or a frozen trained `policy` (`zombie_checkpoint`).
+    opponent: str = "scripted"
+    zombie_checkpoint: str | None = None
+    # Human checkpoint whose actor, critic and value statistics initialize the run.
+    init_checkpoint: str | None = None
     total_steps: int = 20_000_000
     seed: int = 0
     num_threads: int | None = None
@@ -77,19 +86,40 @@ def resolve(path: str) -> Path:
     return REPO / p
 
 
-def evaluate(env_cfg: dict[str, Any], algo: HumanPPO, episodes: int, seed: int) -> dict[str, float]:
+def scripted_zombies(c, e, n, s):
+    return ScriptedZombies(c, e, n, seed=s)
+
+
+def zombie_opponent(cfg: TrainConfig, device: torch.device):
+    """Zombie factory `(config, num_envs, num_zombies, seed) -> policy` for `cfg.opponent`."""
+    if cfg.opponent == "scripted":
+        return scripted_zombies
+    if cfg.opponent != "policy" or not cfg.zombie_checkpoint:
+        raise ValueError("opponent must be 'scripted', or 'policy' with a zombie_checkpoint")
+    path = resolve(cfg.zombie_checkpoint)
+    return lambda c, e, n, s: RecurrentZombiePolicy.from_checkpoint(path, e, n, str(device))
+
+
+def evaluate(
+    env_cfg: dict[str, Any],
+    algo: HumanPPO,
+    episodes: int,
+    seed: int,
+    zombies=scripted_zombies,
+    prefix: str = "eval",
+) -> dict[str, float]:
     stats = play(
         env_cfg,
         lambda c, e, s: RecurrentHumanPolicy(algo.actor, e, algo.device),
-        lambda c, e, n, s: ScriptedZombies(c, e, n, seed=s),
+        zombies,
         episodes=episodes,
         seed=seed,
     )
     return {
-        "eval/survived": stats.survived,
-        "eval/caught": stats.caught,
-        "eval/starved": stats.starved,
-        "eval/mean_length_s": stats.mean_length_s,
+        f"{prefix}/survived": stats.survived,
+        f"{prefix}/caught": stats.caught,
+        f"{prefix}/starved": stats.starved,
+        f"{prefix}/mean_length_s": stats.mean_length_s,
     }
 
 
@@ -120,16 +150,23 @@ def main() -> None:
     # live matches and full-spec runs, not to these stages.
     env_cfg = load_config(resolve(cfg.env_config), env_overrides=False)
     decision_s = env_cfg["dt_s"] * env_cfg["action_repeat"]
+    opponent = zombie_opponent(cfg, device)
     env = HumanTrainingEnv(
         env_cfg,
         cfg.zombie_counts,
         cfg.ppo.num_envs,
-        lambda c, e, n, s: ScriptedZombies(c, e, n, seed=s),
+        opponent,
         seed=cfg.seed,
         num_threads=cfg.num_threads,
     )
     algo = HumanPPO(cfg.ppo, device)
     iteration, steps = 0, 0
+    if cfg.init_checkpoint and not args.resume:
+        sd = torch.load(resolve(cfg.init_checkpoint), map_location=device, weights_only=False)
+        algo.actor.load_state_dict(sd["actor"])
+        algo.critic.load_state_dict(sd["critic"])
+        algo.value_rms.load_state_dict(sd["value_rms"])
+        log.info("initialized from %s (%s steps)", cfg.init_checkpoint, sd.get("steps"))
     if args.resume:
         sd = torch.load(args.resume, map_location=device, weights_only=False)
         algo.load_state_dict(sd)
@@ -152,13 +189,21 @@ def main() -> None:
     baseline = play(
         env_cfg,
         lambda c, e, s: ScriptedHuman(c, e, seed=s),
-        lambda c, e, n, s: ScriptedZombies(c, e, n, seed=s),
+        opponent,
         episodes=cfg.eval_episodes,
         seed=cfg.seed + 777,
     )
     log.info(
-        "baseline (scripted human vs scripted zombies): survived %.1f%%", 100 * baseline.survived
+        "baseline (scripted human vs %s zombies): survived %.1f%%",
+        cfg.opponent,
+        100 * baseline.survived,
     )
+    if iteration == 0 and cfg.init_checkpoint:
+        # The starting point of a fine-tune, at step 0 of the eval curves.
+        ev = evaluate(env_cfg, algo, cfg.eval_episodes, cfg.seed + 777, opponent)
+        ev["eval/baseline_survived"] = baseline.survived
+        metrics.log(0, ev)
+        log.info("initial eval: survived %.1f%%", 100 * ev["eval/survived"])
 
     replay_dir = training_replay_dir()
     batch = env.reset()
@@ -191,7 +236,14 @@ def main() -> None:
                 scalars[f"episode/{name}"] = float((outcomes == code).mean())
 
         if iteration % cfg.eval_every == 0:
-            ev = evaluate(env_cfg, algo, cfg.eval_episodes, cfg.seed + 777)
+            ev = evaluate(env_cfg, algo, cfg.eval_episodes, cfg.seed + 777, opponent)
+            if cfg.opponent != "scripted":
+                # Watch for forgetting how to beat the bots it was trained against first.
+                scalars.update(
+                    evaluate(
+                        env_cfg, algo, cfg.eval_episodes, cfg.seed + 777, prefix="eval_scripted"
+                    )
+                )
             scalars.update(ev)
             scalars["eval/baseline_survived"] = baseline.survived
             log.info(
@@ -214,7 +266,10 @@ def main() -> None:
                 iteration,
                 env_cfg,
                 lambda seed: (RecurrentHumanPolicy(algo.actor, 1, device), "policy"),
-                lambda seed, n=n: (ScriptedZombies(env_cfg, 1, n, seed=seed), "scripted"),
+                lambda seed, n=n: (
+                    opponent(deep_merge(env_cfg, {"zombie_count": n}), 1, n, seed),
+                    "scripted" if cfg.opponent == "scripted" else "policy",
+                ),
                 cfg.replay_episodes,
             )
             log.info("replays: %s", ", ".join(f"{r['id']} {r['outcome']}" for r in recorded))

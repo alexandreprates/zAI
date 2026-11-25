@@ -1,0 +1,35 @@
+# Human fine-tune on the GPU server: the M4 human (human-s0-gpu1, trained on S0 against
+# scripted zombies) continues on s0_small against the frozen M5 zombie policy
+# (zombie-s0small-gpu1, ~97% caught against the scripted human there). Fresh optimizer, lower
+# learning rate and entropy so the start does not wash out the pretrained policy;
+# `eval_scripted/*` tracks whether it forgets the scripted zombies.
+env_config: configs/env/s0_small.yaml
+zombie_counts: [2, 3, 4]
+opponent: policy
+zombie_checkpoint: /checkpoints/zombie/zombie-s0small-gpu1/latest.pt
+init_checkpoint: /checkpoints/human/human-s0-gpu1/latest.pt
+total_steps: 100000000
+seed: 0
+num_threads: 20
+torch_threads: 4
+device: cuda
+eval_every: 20
+eval_episodes: 128
+checkpoint_every: 20
+replay_every: 25
+replay_episodes: 2
+ppo:
+  num_envs: 1024
+  rollout: 128
+  bptt: 64
+  epochs: 4
+  minibatches: 8
+  lr: 0.0001
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip: 0.2
+  ent_start: 0.005
+  ent_end: 0.001
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  hidden: 256
