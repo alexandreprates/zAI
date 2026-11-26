@@ -17,7 +17,11 @@ const COLORS = {
   human: 0x3d8bfd,
   vision: 0x3d8bfd,
   zombie: 0x6cc24a,
-  zombieDark: 0x4f9a35,
+  zombieDark: 0x2f4a22,
+  zombieEye: 0xf2e7a6,
+  zombiePupil: 0xff2a1a,
+  mouth: 0x2a0d0d,
+  tooth: 0xf3eedb,
   eye: 0xffffff,
   pupil: 0x1b1f26,
   noise: [0x7d8594, 0xe0a82e, 0xd9534f],
@@ -373,7 +377,9 @@ export class Scene3D {
 
   // ---------------------------------------------------------------- characters
 
-  /** A rounded body with two eyes looking along +x; zombies hold their arms forward. */
+  /** A rounded body facing +x: the human has round friendly eyes; zombies lean forward with
+   * a scowl (uneven yellowish eyes with glowing red pupils, angry brows, a crooked toothy
+   * mouth). */
   private character(color: number, zombie: boolean): Character {
     const r = 0.3;
     const root = new THREE.Group();
@@ -383,7 +389,13 @@ export class Scene3D {
     trunk.position.y = r + (r * 1.3) / 2;
     trunk.castShadow = true;
     body.add(trunk);
+    if (zombie) this.zombieFace(body, r);
+    else this.humanFace(body, r);
+    root.add(body);
+    return { root, body };
+  }
 
+  private humanFace(body: THREE.Group, r: number): void {
     const eyeGeo = new THREE.SphereGeometry(r * 0.26, 12, 8);
     const pupilGeo = new THREE.SphereGeometry(r * 0.13, 10, 6);
     const eyeMat = new THREE.MeshStandardMaterial({ color: COLORS.eye, roughness: 0.3 });
@@ -396,19 +408,55 @@ export class Scene3D {
       eye.add(pupil);
       body.add(eye);
     }
-    if (zombie) {
-      const armMat = new THREE.MeshStandardMaterial({ color: COLORS.zombieDark, roughness: 0.6 });
-      const armGeo = new THREE.CapsuleGeometry(r * 0.16, r * 1.1, 4, 8);
-      for (const side of [-1, 1]) {
-        const arm = new THREE.Mesh(armGeo, armMat);
-        arm.rotation.z = Math.PI / 2;
-        arm.position.set(r * 1.05, r * 1.45, side * r * 0.62);
-        arm.castShadow = true;
-        body.add(arm);
-      }
+  }
+
+  private zombieFace(body: THREE.Group, r: number): void {
+    // Hunched forward.
+    body.rotation.z = -0.14;
+    const eyeMat = new THREE.MeshStandardMaterial({ color: COLORS.zombieEye, roughness: 0.4 });
+    const pupilMat = new THREE.MeshBasicMaterial({ color: COLORS.zombiePupil });
+    const darkMat = new THREE.MeshStandardMaterial({ color: COLORS.zombieDark, roughness: 0.8 });
+    const toothMat = new THREE.MeshStandardMaterial({ color: COLORS.tooth, roughness: 0.5 });
+    // Uneven eyes: the left one bulges, the right one is small and lower.
+    for (const [side, size, y] of [
+      [-1, 0.3, 2.08],
+      [1, 0.21, 1.98],
+    ]) {
+      const eye = new THREE.Mesh(new THREE.SphereGeometry(r * size, 12, 8), eyeMat);
+      eye.position.set(r * 0.8, r * y, side * r * 0.37);
+      // Pinpoint pupils that glow (unlit material).
+      const pupil = new THREE.Mesh(new THREE.SphereGeometry(r * size * 0.42, 10, 6), pupilMat);
+      pupil.position.set(r * size * 0.75, 0, 0);
+      eye.add(pupil);
+      body.add(eye);
+      // Brow slanting down towards the middle of the face.
+      const brow = new THREE.Mesh(new THREE.BoxGeometry(r * 0.12, r * 0.1, r * 0.46), darkMat);
+      brow.position.set(r * 0.93, r * (y + size + 0.06), side * r * 0.33);
+      brow.rotation.x = -side * 0.5;
+      body.add(brow);
     }
-    root.add(body);
-    return { root, body };
+    // Crooked open mouth with jagged teeth.
+    const mouth = new THREE.Group();
+    mouth.position.set(r * 0.97, r * 1.42, r * 0.04);
+    mouth.rotation.x = 0.18;
+    const hole = new THREE.Mesh(new THREE.BoxGeometry(r * 0.12, r * 0.3, r * 0.95), new THREE.MeshBasicMaterial({ color: COLORS.mouth }));
+    mouth.add(hole);
+    const toothGeo = new THREE.ConeGeometry(r * 0.07, r * 0.16, 4);
+    for (const [z, up] of [
+      [-0.32, false],
+      [-0.08, false],
+      [0.2, false],
+      [-0.2, true],
+      [0.1, true],
+      [0.33, true],
+    ] as [number, boolean][]) {
+      const tooth = new THREE.Mesh(toothGeo, toothMat);
+      // Upper teeth hang down, lower teeth point up.
+      tooth.rotation.x = up ? 0 : Math.PI;
+      tooth.position.set(r * 0.05, (up ? -1 : 1) * r * 0.09, z * r);
+      mouth.add(tooth);
+    }
+    body.add(mouth);
   }
 
   private ensureZombies(n: number): void {
