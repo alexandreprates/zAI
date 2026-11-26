@@ -51,6 +51,17 @@ export class TopDown {
     this.app.ticker.add(() => this.draw());
   }
 
+  /** Starts or stops drawing (the hidden view does not draw); resizes on show, since the
+   * container had no size while hidden. */
+  setActive(active: boolean): void {
+    if (active) {
+      this.app.resize();
+      this.app.ticker.start();
+    } else {
+      this.app.ticker.stop();
+    }
+  }
+
   setInit(frame: InitFrame): void {
     this.init = frame;
     this.prev = this.curr = null;

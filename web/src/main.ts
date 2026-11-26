@@ -10,6 +10,7 @@ import {
   Stream,
 } from "./api";
 import { Charts } from "./charts";
+import type { Scene3D } from "./scene3d";
 import { TopDown } from "./topdown";
 import type { Agent, Frame, InitFrame, ModelInfo, ReplaySummary, SnapshotFrame } from "./types";
 
@@ -17,6 +18,11 @@ const SPEEDS = [0.5, 1, 2, 4, 8, 16];
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const view = new TopDown();
+/** The 3D view is loaded (with three.js) the first time it is selected. */
+let scene3d: Scene3D | null = null;
+type ViewMode = "2d" | "3d";
+let viewMode: ViewMode = localStorage.getItem("zai.view") === "3d" ? "3d" : "2d";
+let follow = localStorage.getItem("zai.follow") !== "off";
 let charts: Charts;
 let stream: Stream | null = null;
 let init: InitFrame | null = null;
@@ -104,6 +110,7 @@ function onFrame(frame: Frame): void {
   if (frame.type === "init") {
     init = frame;
     view.setInit(frame);
+    scene3d?.setInit(frame);
     const seek = $<HTMLInputElement>("seek");
     seek.hidden = frame.source !== "replay";
     seek.max = String(frame.total_ticks ?? 0);
@@ -112,6 +119,7 @@ function onFrame(frame: Frame): void {
   }
   last = frame;
   view.pushSnapshot(frame);
+  scene3d?.pushSnapshot(frame);
   renderControls();
 }
 
@@ -137,7 +145,7 @@ function renderControls(): void {
 
 function showStage(visible: boolean): void {
   $("stage").hidden = !visible;
-  for (const id of ["play-pause", "speeds"]) $(id).hidden = !visible;
+  for (const id of ["play-pause", "speeds", "views"]) $(id).hidden = !visible;
   if (!visible) {
     $("hud").hidden = true;
     $<HTMLInputElement>("seek").hidden = true;
@@ -292,7 +300,41 @@ async function refreshLists(): Promise<void> {
   }
 }
 
+async function setView(mode: ViewMode): Promise<void> {
+  viewMode = mode;
+  localStorage.setItem("zai.view", mode);
+  if (mode === "3d" && !scene3d) {
+    const { Scene3D } = await import("./scene3d");
+    scene3d = new Scene3D();
+    scene3d.mount($("view-3d"));
+    scene3d.setFollow(follow);
+    // Catch up with the stream: the static map and the latest state.
+    if (init) scene3d.setInit(init);
+    if (last) scene3d.pushSnapshot(last);
+  }
+  if (viewMode !== mode) return; // switched again while loading
+  $("view-2d").hidden = mode !== "2d";
+  $("view-3d").hidden = mode !== "3d";
+  view.setActive(mode === "2d");
+  scene3d?.setActive(mode === "3d");
+  for (const b of document.querySelectorAll<HTMLButtonElement>("#views button[data-view]")) {
+    b.classList.toggle("active", b.dataset.view === mode);
+  }
+  $("follow").hidden = mode !== "3d";
+}
+
 function setupControls(): void {
+  for (const b of document.querySelectorAll<HTMLButtonElement>("#views button[data-view]")) {
+    b.onclick = () => void setView(b.dataset.view as ViewMode);
+  }
+  const followBtn = $<HTMLButtonElement>("follow");
+  followBtn.classList.toggle("active", follow);
+  followBtn.onclick = () => {
+    follow = !follow;
+    localStorage.setItem("zai.follow", follow ? "on" : "off");
+    followBtn.classList.toggle("active", follow);
+    scene3d?.setFollow(follow);
+  };
   const speeds = $("speeds");
   for (const s of SPEEDS) {
     const b = document.createElement("button");
@@ -356,7 +398,8 @@ function setupControls(): void {
 }
 
 async function main(): Promise<void> {
-  await view.mount($("stage"));
+  await view.mount($("view-2d"));
+  await setView(viewMode);
   charts = new Charts($("charts"));
   setupControls();
   await refreshLists();

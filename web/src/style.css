@@ -177,7 +177,8 @@ main {
   flex-wrap: wrap;
 }
 
-#speeds {
+#speeds,
+#views {
   display: flex;
   gap: 4px;
 }
@@ -195,6 +196,17 @@ main {
 #stage {
   flex: 1;
   min-height: 0;
+  position: relative;
+}
+
+#stage .view {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+#stage .view canvas {
+  display: block;
 }
 
 #hud[hidden] {
@@ -259,7 +271,9 @@ main {
 
 #charts[hidden],
 #stage[hidden],
+#stage .view[hidden],
 #speeds[hidden],
+#views[hidden],
 button[hidden] {
   display: none;
 }

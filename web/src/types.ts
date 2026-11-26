@@ -33,6 +33,7 @@ export interface SnapshotFrame {
   speed: number;
   paused: boolean;
   human: { x: number; y: number; hx: number; hy: number; carried: number; hunger: number };
+  /** `[x, y, heading_x, heading_y]` per zombie. */
   zombies: [number, number, number, number][];
   doors: number;
   food: [number, number][];

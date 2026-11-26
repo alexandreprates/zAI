@@ -61,11 +61,19 @@
         <div id="toolbar">
           <button id="play-pause" disabled>Pause</button>
           <div id="speeds"></div>
+          <div id="views" hidden>
+            <button data-view="2d">2D</button>
+            <button data-view="3d">3D</button>
+            <button id="follow" title="Keep the camera on the human (drag to orbit, scroll to zoom)">Follow</button>
+          </div>
           <input id="seek" type="range" min="0" max="0" value="0" hidden />
           <span id="status">Select a match or replay</span>
         </div>
         <div id="run-replays" hidden></div>
-        <div id="stage"></div>
+        <div id="stage">
+          <div id="view-2d" class="view"></div>
+          <div id="view-3d" class="view" hidden></div>
+        </div>
         <div id="charts" hidden></div>
         <div id="hud" hidden>
           <div><span class="label">Time</span> <span id="hud-time"></span></div>
