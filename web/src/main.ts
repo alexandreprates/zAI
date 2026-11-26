@@ -230,6 +230,31 @@ function item(title: string, detail: string, key: string, onOpen: () => void): H
   return li;
 }
 
+interface Choice {
+  key: string;
+  label: string;
+  title: string;
+  open: () => void;
+}
+
+/** Fills a sidebar select (replays, runs) with a placeholder and one option per choice; the
+ * current selection (`selected`) shows as the chosen option. */
+function fillSelect(select: HTMLSelectElement, placeholder: string, choices: Choice[]): void {
+  const empty = new Option(choices.length > 0 ? `Select… (${placeholder})` : `No ${placeholder.replace(/^0 /, "")}`, "");
+  const options = choices.map((c) => {
+    const o = new Option(c.label, c.key);
+    o.title = c.title;
+    return o;
+  });
+  select.replaceChildren(empty, ...options);
+  select.disabled = choices.length === 0;
+  select.value = choices.some((c) => c.key === selected) ? (selected ?? "") : "";
+  select.onchange = () => {
+    choices.find((c) => c.key === select.value)?.open();
+    select.blur();
+  };
+}
+
 async function refreshLists(): Promise<void> {
   try {
     const [matches, allReplays, runs, allModels] = await Promise.all([
@@ -247,6 +272,9 @@ async function refreshLists(): Promise<void> {
     // Re-render only on change, so clicks are not lost to a DOM swap.
     const signature = JSON.stringify([matches, allReplays, runs, selected, currentRun]);
     if (signature === lastLists) return;
+    // Rebuilding a select's options would close it while the user is picking from it.
+    const active = document.activeElement;
+    if (active instanceof HTMLSelectElement && ["replays", "runs"].includes(active.id)) return;
     lastLists = signature;
     replays = allReplays;
     renderRunReplays();
@@ -273,27 +301,32 @@ async function refreshLists(): Promise<void> {
         return li;
       }),
     );
-    $("replays").replaceChildren(
-      ...allReplays.filter((r) => !runIds.has(r.match_id)).map((r) => {
+    const ownReplays = allReplays.filter((r) => !runIds.has(r.match_id));
+    fillSelect(
+      $<HTMLSelectElement>("replays"),
+      `${ownReplays.length} replays`,
+      ownReplays.map((r) => {
         const key = `r:${r.id}`;
-        const vs = `${r.human_model ?? r.human}/${r.zombie_model ?? r.zombies}`;
-        return item(r.id, `${r.outcome} · ${r.length} ticks · ${vs}`, key, () =>
-          watch(`/ws/replay/${r.id}`, key),
-        );
+        const vs = `${r.human_model ?? r.human} vs ${r.zombie_model ?? r.zombies}`;
+        return {
+          key,
+          label: `${r.id} · ${r.outcome} · ${r.length} ticks`,
+          title: vs,
+          open: () => watch(`/ws/replay/${r.id}`, key),
+        };
       }),
     );
-    $("runs").replaceChildren(
-      ...runs.map((r) =>
-        item(
-          r.run_id,
-          `${r.models.join(", ")} · step ${r.last_step.toLocaleString()}${
-            perRun.has(r.run_id) ? ` · ${perRun.get(r.run_id)} episodes` : ""
-          }`,
-          `t:${r.run_id}`,
-          () =>
-          showRun(r.run_id),
-        ),
-      ),
+    fillSelect(
+      $<HTMLSelectElement>("runs"),
+      `${runs.length} runs`,
+      runs.map((r) => ({
+        key: `t:${r.run_id}`,
+        label: `${r.run_id} · step ${r.last_step.toLocaleString()}`,
+        title: `${r.models.join(", ")}${
+          perRun.has(r.run_id) ? ` · ${perRun.get(r.run_id)} recorded episodes` : ""
+        }`,
+        open: () => showRun(r.run_id),
+      })),
     );
   } catch (e) {
     $("status").textContent = `Server unavailable: ${(e as Error).message}`;
