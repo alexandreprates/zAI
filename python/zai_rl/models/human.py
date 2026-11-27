@@ -5,7 +5,8 @@ import zai_sim
 from torch import nn
 from torch.distributions import Categorical
 
-from zai_env.layout import HUMAN
+from zai_env.layout import HUMAN, OBS_VERSION, Layout
+from zai_env.legacy import HUMAN_V1
 
 from .encoders import RayEncoder, SetEncoder, mlp, run_gru_segments
 
@@ -13,30 +14,46 @@ MOVE = zai_sim.MOVE_ACTIONS
 INTERACT = zai_sim.INTERACT_ACTIONS
 
 
-def _block(name: str) -> tuple[int, int, int]:
-    b = HUMAN.blocks[name]
+def _block(layout: Layout, name: str) -> tuple[int, int, int]:
+    b = layout.blocks[name]
     return b["start"], b["slots"], len(b["fields"])
 
 
-class HumanActor(nn.Module):
-    """Entity encoders + ray conv + MLP + GRU; heads for movement (17) and interaction (3)."""
+def own_columns(layout: Layout, obs_version: int) -> list[int]:
+    """Columns of the `self` block fed to an actor: layout v2 leaves out the absolute
+    position (out of distribution on every larger map; houses act as landmarks)."""
+    fields = layout.blocks["self"]["fields"]
+    skip = {"x", "y"} if obs_version >= 2 else set()
+    return [i for i, f in enumerate(fields) if f not in skip]
 
-    def __init__(self, hidden: int = 256, entity_hidden: int = 64):
+
+class HumanActor(nn.Module):
+    """Entity encoders + ray conv + MLP + GRU; heads for movement (17) and interaction (3).
+
+    `obs_version` selects the observation layout (2: current, 1: the M4/M5 checkpoints, which
+    play in the v2 env through `zai_env.legacy.adapt_v1_human`)."""
+
+    def __init__(self, hidden: int = 256, entity_hidden: int = 64, obs_version: int = OBS_VERSION):
         super().__init__()
-        self.self_slice = _block("self")
-        self.zombie_slice = _block("zombies")
-        self.food_slice = _block("food")
-        self.house_slice = _block("houses")
-        self.ray_slice = _block("rays")
-        self.zombie_valid = HUMAN.blocks["zombies"]["fields"].index("valid")
-        self.food_valid = HUMAN.blocks["food"]["fields"].index("valid")
+        layout = HUMAN if obs_version == OBS_VERSION else HUMAN_V1
+        self.obs_version = obs_version
+        self.self_slice = _block(layout, "self")
+        self.zombie_slice = _block(layout, "zombies")
+        self.food_slice = _block(layout, "food")
+        self.house_slice = _block(layout, "houses")
+        self.ray_slice = _block(layout, "rays")
+        self.zombie_valid = layout.blocks["zombies"]["fields"].index("valid")
+        self.food_valid = layout.blocks["food"]["fields"].index("valid")
+        house_fields = layout.blocks["houses"]["fields"]
+        self.house_valid = house_fields.index("valid") if "valid" in house_fields else None
+        self.register_buffer("own_cols", torch.tensor(own_columns(layout, obs_version)), False)
 
         self.zombies = SetEncoder(self.zombie_slice[2], entity_hidden)
         self.food = SetEncoder(self.food_slice[2], entity_hidden)
         self.houses = SetEncoder(self.house_slice[2], entity_hidden)
         self.rays = RayEncoder(self.ray_slice[1], self.ray_slice[2])
         in_dim = (
-            self.self_slice[2]
+            len(self.own_cols)
             + self.zombies.out_dim
             + self.food.out_dim
             + self.houses.out_dim
@@ -57,17 +74,21 @@ class HumanActor(nn.Module):
         return obs[:, start : start + slots * width].reshape(-1, slots, width)
 
     def encode(self, obs: torch.Tensor) -> torch.Tensor:
-        own = self._slots(obs, self.self_slice)[:, 0]
+        own = self._slots(obs, self.self_slice)[:, 0, self.own_cols]
         zombies = self._slots(obs, self.zombie_slice)
         food = self._slots(obs, self.food_slice)
         houses = self._slots(obs, self.house_slice)
         rays = self._slots(obs, self.ray_slice)
+        if self.house_valid is None:  # layout v1 has no valid flag
+            house_mask = houses.abs().sum(-1) > 0
+        else:
+            house_mask = houses[..., self.house_valid] > 0.5
         x = torch.cat(
             [
                 own,
                 self.zombies(zombies, zombies[..., self.zombie_valid] > 0.5),
                 self.food(food, food[..., self.food_valid] > 0.5),
-                self.houses(houses, houses.abs().sum(-1) > 0),
+                self.houses(houses, house_mask),
                 self.rays(rays),
             ],
             dim=-1,
@@ -111,8 +132,9 @@ class HumanActor(nn.Module):
 class HumanCritic(nn.Module):
     """Value of the privileged global state (training only)."""
 
-    def __init__(self, hidden: int = 512):
+    def __init__(self, hidden: int = 512, obs_version: int = OBS_VERSION):
         super().__init__()
+        self.obs_version = obs_version  # same size in v1 and v2; v1 states need adapt_v1_state
         self.net = nn.Sequential(
             nn.Linear(zai_sim.STATE_DIM, hidden),
             nn.ReLU(),

@@ -15,7 +15,7 @@ mod tests;
 
 pub use config::{Config, ConfigError, ZombieShapingMode};
 pub use env::{Env, HumanAction, NoiseKind, Outcome, StepResult};
-pub use obs::{HUMAN_OBS_DIM, STATE_DIM, ZOMBIE_OBS_DIM};
+pub use obs::{HUMAN_OBS_DIM, OBS_VERSION, STATE_DIM, ZOMBIE_OBS_DIM};
 
 /// Version of the simulation crate, exposed to the bindings and the server.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

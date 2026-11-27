@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tract_onnx::prelude::*;
 use zai_sim::env::{INTERACT_ACTIONS, MOVE_ACTIONS};
 use zai_sim::obs::{write_human_obs, write_zombie_obs};
-use zai_sim::{Env, HumanAction, HUMAN_OBS_DIM, ZOMBIE_OBS_DIM};
+use zai_sim::{Env, HumanAction, HUMAN_OBS_DIM, OBS_VERSION, ZOMBIE_OBS_DIM};
 
 /// Model ids are file names, with the same rules as replay ids.
 pub use crate::replay::valid_id;
@@ -48,9 +48,37 @@ pub struct ModelInfo {
     pub stage: String,
     pub hidden: usize,
     pub obs_dim: usize,
+    /// Observation layout the model was trained on (models exported before M6.1 have none: 1).
+    #[serde(default = "layout_v1")]
+    pub obs_version: u32,
     pub created_at: u64,
     /// Full env config of the training run (the map matches with this model should use).
     pub config: serde_json::Value,
+}
+
+fn layout_v1() -> u32 {
+    1
+}
+
+impl ModelInfo {
+    /// Whether this build's simulation writes the observations the model expects.
+    pub fn compatible(&self) -> Result<(), String> {
+        if self.obs_version != OBS_VERSION {
+            return Err(format!(
+                "model {:?} was trained on observation layout v{}, the simulation writes v{}",
+                self.id, self.obs_version, OBS_VERSION
+            ));
+        }
+        if self.obs_dim != self.side.obs_dim() {
+            return Err(format!(
+                "model {:?} expects {} observation features, the simulation writes {}",
+                self.id,
+                self.obs_dim,
+                self.side.obs_dim()
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -63,7 +91,8 @@ impl ModelStore {
         Self { dir }
     }
 
-    /// Models with both files present, newest first. Unreadable metadata is logged and skipped.
+    /// Models with both files present that this build can run, newest first. Unreadable or
+    /// incompatible metadata (another observation layout) is logged and skipped.
     pub fn list(&self) -> Vec<ModelInfo> {
         let mut out: Vec<ModelInfo> = std::fs::read_dir(&self.dir)
             .into_iter()
@@ -72,13 +101,15 @@ impl ModelStore {
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|x| x == "json"))
             .filter(|p| p.with_extension("onnx").is_file())
-            .filter_map(|p| match Self::read_info(&p) {
-                Ok(info) => Some(info),
-                Err(e) => {
-                    tracing::warn!("skipping model {}: {e}", p.display());
-                    None
-                }
-            })
+            .filter_map(
+                |p| match Self::read_info(&p).and_then(|i| i.compatible().map(|_| i)) {
+                    Ok(info) => Some(info),
+                    Err(e) => {
+                        tracing::warn!("skipping model {}: {e}", p.display());
+                        None
+                    }
+                },
+            )
             .collect();
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
         out
@@ -122,15 +153,7 @@ pub struct LoadedModel {
 
 impl LoadedModel {
     pub fn load(path: PathBuf, info: ModelInfo, batch: usize) -> Result<Self, String> {
-        let side = info.side;
-        if info.obs_dim != side.obs_dim() {
-            return Err(format!(
-                "model {:?} expects {} observation features, the simulation writes {}",
-                info.id,
-                info.obs_dim,
-                side.obs_dim()
-            ));
-        }
+        info.compatible()?;
         let plan = tract_onnx::onnx()
             .model_for_path(&path)
             .and_then(|m| m.with_input_fact(0, f32::fact([batch, info.obs_dim]).into()))
@@ -139,7 +162,7 @@ impl LoadedModel {
             .and_then(|m| m.into_runnable())
             .map_err(|e| format!("cannot load {}: {e:#}", path.display()))?;
         let outputs = plan.model().outputs.len();
-        let expected = match side {
+        let expected = match info.side {
             Side::Human => 3,
             Side::Zombie => 2,
         };
@@ -300,5 +323,26 @@ mod tests {
         assert!(!valid_id("../etc"));
         assert!(!valid_id(""));
         assert!(!valid_id(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn models_of_another_observation_layout_are_incompatible() {
+        let info = |extra: &str| -> ModelInfo {
+            serde_json::from_str(&format!(
+                r#"{{"id": "m", "side": "zombie", "run_id": "r", "iteration": 0, "steps": 0,
+                    "stage": "s0", "hidden": 8, "created_at": 0, "config": {{}}{extra}}}"#
+            ))
+            .unwrap()
+        };
+        let v1 = info(r#", "obs_dim": 252"#);
+        assert_eq!(
+            v1.obs_version, 1,
+            "models exported before M6.1 are layout v1"
+        );
+        assert!(v1.compatible().unwrap_err().contains("layout v1"));
+        let v2 = info(&format!(
+            r#", "obs_dim": {ZOMBIE_OBS_DIM}, "obs_version": {OBS_VERSION}"#
+        ));
+        assert!(v2.compatible().is_ok());
     }
 }

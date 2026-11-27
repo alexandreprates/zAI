@@ -17,19 +17,21 @@ import numpy as np
 import torch
 from torch import nn
 
-from zai_env.layout import STATE
+from zai_env.layout import FAR_M, STATE
 
 from ..envs import ZombieBatch, ZombieTrainingEnv
 from ..models import ZombieActor, ZombieCritic
 from ..profiling import timer
-from .common import EpisodeStats, RunningMeanStd, bptt_sequences, gae
+from .common import EpisodeStats, RunningMeanStd, bptt_sequences, gae, require_obs_version
 
 
-def nearest_zombie_m(state: np.ndarray, map_size_m: float) -> np.ndarray:
-    """Distance from the human to the nearest zombie per env, from the global state `[E, S]`."""
-    dist = STATE.field(state, "zombies", "dist_to_human")
+def nearest_zombie_m(state: np.ndarray) -> np.ndarray:
+    """Distance from the human to the nearest zombie per env, from the positions in the global
+    state `[E, S]` (`dist_to_human` saturates at 100 m in layout v2)."""
+    dx = STATE.field(state, "zombies", "x") - STATE.scalar(state, "human", "x")[:, None]
+    dy = STATE.field(state, "zombies", "y") - STATE.scalar(state, "human", "y")[:, None]
     valid = STATE.field(state, "zombies", "valid") > 0.5
-    return np.where(valid, dist, np.inf).min(axis=1) * map_size_m
+    return np.where(valid, np.hypot(dx, dy), np.inf).min(axis=1) * FAR_M
 
 
 @dataclass
@@ -106,7 +108,7 @@ class ZombieMAPPO:
         h0 = []
         nearest = []
         for t in range(T):
-            nearest.append(nearest_zombie_m(batch.state, env.map_size_m).mean())
+            nearest.append(nearest_zombie_m(batch.state).mean())
             with timer("policy"):
                 obs = self._t(batch.obs)
                 state = self._t(batch.state)
@@ -263,9 +265,11 @@ class ZombieMAPPO:
             "value_rms": self.value_rms.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "mappo_config": asdict(self.cfg),
+            "obs_version": self.actor.obs_version,
         }
 
     def load_state_dict(self, sd: dict[str, Any]) -> None:
+        require_obs_version(sd, self.actor.obs_version, "the checkpoint")
         self.actor.load_state_dict(sd["actor"])
         self.critic.load_state_dict(sd["critic"])
         self.value_rms.load_state_dict(sd["value_rms"])

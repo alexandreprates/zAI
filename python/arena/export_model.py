@@ -30,6 +30,8 @@ import zai_sim
 from torch import nn
 
 from zai_env.config import config_dir, load_config
+from zai_env.layout import OBS_VERSION
+from zai_rl.algos.common import require_obs_version
 from zai_rl.models import HumanActor, ZombieActor
 
 log = logging.getLogger("export_model")
@@ -144,6 +146,7 @@ def export_actor(
         "side": side,
         "hidden": actor.hidden_size,
         "obs_dim": obs_dim,
+        "obs_version": actor.obs_version,
         "created_at": int(time.time()),
         "stage": stage_name(meta["config"]),
         **meta,
@@ -156,6 +159,8 @@ def export_actor(
 
 
 def actor_from_checkpoint(sd: dict[str, Any]) -> HumanActor | ZombieActor:
+    # The server only runs models of the current layout (it writes v2 observations).
+    require_obs_version(sd, OBS_VERSION, "the checkpoint")
     if "mappo_config" in sd:
         actor: HumanActor | ZombieActor = ZombieActor(hidden=sd["mappo_config"]["hidden"])
     else:

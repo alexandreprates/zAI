@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 import zai_sim
 
-from zai_env.layout import HUMAN
+from zai_env.layout import FAR_M, HUMAN, house_deltas_m
 
 from .common import direction_to_action
 
@@ -32,6 +32,7 @@ class ScriptedHuman:
         arrive_m: float = 3.0,
     ):
         self.size = config["map_size_m"]
+        self.house_depth = config["house"]["depth_m"]
         self.vision = config["human"]["vision_radius_m"]
         self.houses = config["house_count"]
         self.flee_m = flee_m
@@ -63,17 +64,17 @@ class ScriptedHuman:
 
         # 3. Wander between houses (or waypoints).
         if self.houses > 0:
-            hx = HUMAN.field(human_obs, "houses", "dx")[rows, self.target_house]
-            hy = HUMAN.field(human_obs, "houses", "dy")[rows, self.target_house]
-            arrived = np.hypot(hx, hy) * self.size < self.arrive_m
+            center = house_deltas_m(human_obs, HUMAN, self.house_depth)[0]  # [E, H, 2] meters
+            to_house = center[rows, self.target_house]
+            arrived = np.hypot(to_house[:, 0], to_house[:, 1]) < self.arrive_m
             self.target_house[arrived] = self.rng.integers(0, self.houses, int(arrived.sum()))
-            wander_dx = HUMAN.field(human_obs, "houses", "dx")[rows, self.target_house]
-            wander_dy = HUMAN.field(human_obs, "houses", "dy")[rows, self.target_house]
+            wander_dx, wander_dy = center[rows, self.target_house].T
         else:
+            # Waypoints in map units ([0, 1] across the map).
             pos = np.stack(
                 [HUMAN.scalar(human_obs, "self", "x"), HUMAN.scalar(human_obs, "self", "y")],
                 axis=-1,
-            )
+            ) * (FAR_M / self.size)
             to_wp = self.waypoints - pos
             arrived = np.linalg.norm(to_wp, axis=-1) * self.size < self.arrive_m
             self.waypoints[arrived] = self.rng.uniform(0.0, 1.0, (int(arrived.sum()), 2))

@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 import zai_sim
 
-from zai_env.layout import ZOMBIE
+from zai_env.layout import FAR_M, ZOMBIE
 
 from .common import direction_to_action
 
@@ -27,10 +27,11 @@ class ScriptedZombies:
         self.waypoints = self.rng.uniform(0.0, 1.0, (num_envs, num_zombies, 2))
 
     def act(self, zombie_obs: np.ndarray) -> np.ndarray:
+        # Waypoints in map units ([0, 1] across the map); positions are `pos / FAR_M`.
         pos = np.stack(
             [ZOMBIE.scalar(zombie_obs, "self", "x"), ZOMBIE.scalar(zombie_obs, "self", "y")],
             axis=-1,
-        )
+        ) * (FAR_M / self.size)
         blocked = ZOMBIE.scalar(zombie_obs, "self", "blocked") > 0.5
 
         # Newest heard event is slot 0; chase it until close enough.

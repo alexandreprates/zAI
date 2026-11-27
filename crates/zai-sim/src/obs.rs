@@ -1,5 +1,11 @@
 //! Observation and state encoding shared by the trainer and the server.
-//! Layouts are documented in docs/ARCHITECTURE.md section 3.6.
+//! Layouts are documented in docs/ARCHITECTURE.md section 3.6 (v1) and 4.8.2 (v2).
+//!
+//! Layout v2 normalizes distances by constants instead of the map size, so the same input
+//! means the same distance on every curriculum stage: deltas to static landmarks are
+//! `sat(v) = v / max(|v|, NEAR_M)` (linear up to 100 m, then a unit direction) plus a far-scale
+//! distance `|v| / FAR_M`, absolute positions are `pos / FAR_M`, and the time left is
+//! `(cap - t) / TIME_SCALE_S`.
 
 use std::f32::consts::TAU;
 
@@ -9,9 +15,19 @@ use crate::env::{Env, NoiseKind};
 use crate::map::ObstacleKind;
 use crate::{MAX_FOOD, MAX_HOUSES, MAX_ZOMBIES};
 
-pub const HUMAN_OBS_DIM: usize = 584;
-pub const ZOMBIE_OBS_DIM: usize = 252;
+/// Version of the observation layouts, saved with checkpoints and exported models.
+pub const OBS_VERSION: u32 = 2;
+
+pub const HUMAN_OBS_DIM: usize = 608;
+pub const ZOMBIE_OBS_DIM: usize = 276;
 pub const STATE_DIM: usize = 1144;
+
+/// Near scale (vision radius, shaping range): deltas are linear up to this distance.
+pub const NEAR_M: f32 = 100.0;
+/// Far scale (the PRD map side) for absolute positions and far distances.
+pub const FAR_M: f32 = 500.0;
+/// Time scale (the PRD episode cap) for the time left.
+pub const TIME_SCALE_S: f32 = 1200.0;
 
 const MAX_VISIBLE_ZOMBIES: usize = 32;
 const MAX_VISIBLE_FOOD: usize = 16;
@@ -60,6 +76,18 @@ impl<'a> Writer<'a> {
     }
 }
 
+/// Delta to a landmark: linear up to `NEAR_M`, a unit direction beyond.
+fn sat(v: Vec2) -> Vec2 {
+    v / v.length().max(NEAR_M)
+}
+
+/// Distances to the west, east, south and north map edges, saturated at `NEAR_M`.
+fn wall_distances(w: &mut Writer, pos: Vec2, size: f32) {
+    for d in [pos.x, size - pos.x, pos.y, size - pos.y] {
+        w.push(d.clamp(0.0, NEAR_M) / NEAR_M);
+    }
+}
+
 fn angle_sin_cos(dir: Vec2) -> Vec2 {
     let d = dir.normalize_or(Vec2::X);
     Vec2::new(d.y, d.x)
@@ -74,8 +102,9 @@ pub fn write_human_obs(env: &Env, out: &mut [f32]) {
     let vr = cfg.human.vision_radius_m;
     let inside = env.map.house_at(h.pos);
 
-    // Self (16).
-    w.vec(h.pos / size);
+    // Self (20).
+    w.vec(h.pos / FAR_M);
+    wall_distances(&mut w, h.pos, size);
     w.vec(angle_sin_cos(h.heading));
     w.vec(h.vel);
     let bucket = h.carried.min(CARRIED_CAP);
@@ -111,19 +140,22 @@ pub fn write_human_obs(env: &Env, out: &mut [f32]) {
     }
     w.end_block(start, MAX_VISIBLE_FOOD * 4);
 
-    // Houses (10 x 12).
+    // Houses (10 x 14).
     let start = w.i;
     for (hi, house) in env.map.houses.iter().enumerate() {
-        w.vec((house.center - h.pos) / size);
+        let d = house.center - h.pos;
+        w.flag(true);
+        w.vec(sat(d));
+        w.push(d.length() / FAR_M);
         w.vec(angle_sin_cos(house.axis_x));
-        w.vec((house.doors[0].center - h.pos) / size);
-        w.vec((house.doors[1].center - h.pos) / size);
+        w.vec(sat(house.doors[0].center - h.pos));
+        w.vec(sat(house.doors[1].center - h.pos));
         w.flag(h.door_memory[hi][0]);
         w.flag(h.door_memory[hi][1]);
         w.flag(h.doors_visible[hi]);
         w.flag(inside == Some(hi));
     }
-    w.end_block(start, MAX_HOUSES * 12);
+    w.end_block(start, MAX_HOUSES * 14);
 
     // Ray cast (64 x 3): world-frame directions over 360 degrees, or spread across the
     // field of view around the heading when it is narrower.
@@ -153,8 +185,9 @@ pub fn write_zombie_obs(env: &Env, index: usize, out: &mut [f32]) {
     let hearing = cfg.zombie.hearing_radius_m;
     let inside = env.map.house_at(z.pos);
 
-    // Self (12).
-    w.vec(z.pos / size);
+    // Self (16).
+    w.vec(z.pos / FAR_M);
+    wall_distances(&mut w, z.pos, size);
     w.vec(angle_sin_cos(z.heading));
     w.vec(z.vel / cfg.zombie.speed_mps);
     w.flag(inside.is_some());
@@ -164,7 +197,7 @@ pub fn write_zombie_obs(env: &Env, index: usize, out: &mut [f32]) {
             .map_or(1.0, |t| ((env.time - t) / memory).min(1.0)),
     );
     w.push(env.zombies.len() as f32 / MAX_ZOMBIES as f32);
-    w.push(env.time / cfg.episode_cap_s);
+    w.push((cfg.episode_cap_s - env.time) / TIME_SCALE_S);
     w.push(1.0);
 
     // Heard noise buffer (8 x 9), newest first.
@@ -204,15 +237,18 @@ pub fn write_zombie_obs(env: &Env, index: usize, out: &mut [f32]) {
     }
     w.end_block(start, MAX_PEERS * 5);
 
-    // Static map: houses (10 x 8), door states not observed.
+    // Static map: houses (10 x 10), door states not observed.
     let start = w.i;
     for house in &env.map.houses {
-        w.vec((house.center - z.pos) / size);
+        let d = house.center - z.pos;
+        w.flag(true);
+        w.vec(sat(d));
+        w.push(d.length() / FAR_M);
         w.vec(angle_sin_cos(house.axis_x));
-        w.vec((house.doors[0].center - z.pos) / size);
-        w.vec((house.doors[1].center - z.pos) / size);
+        w.vec(sat(house.doors[0].center - z.pos));
+        w.vec(sat(house.doors[1].center - z.pos));
     }
-    w.end_block(start, MAX_HOUSES * 8);
+    w.end_block(start, MAX_HOUSES * 10);
 
     // Proximity rays (16 x 3).
     for k in 0..ZOMBIE_RAYS {
@@ -232,10 +268,9 @@ pub fn write_state(env: &Env, out: &mut [f32]) {
     let mut w = Writer::new(out, STATE_DIM);
     let cfg = &env.cfg;
     let h = &env.human;
-    let size = cfg.map_size_m;
 
     // Human (16).
-    w.vec(h.pos / size);
+    w.vec(h.pos / FAR_M);
     w.vec(h.vel / cfg.human.base_speed_mps);
     w.push(h.carried.min(CARRIED_CAP) as f32 / CARRIED_CAP as f32);
     w.push(h.hunger_s / cfg.human.hunger_interval_s);
@@ -248,11 +283,11 @@ pub fn write_state(env: &Env, out: &mut [f32]) {
     let start = w.i;
     for z in &env.zombies {
         let d = z.pos.distance(h.pos);
-        w.vec(z.pos / size);
+        w.vec(z.pos / FAR_M);
         w.vec(z.vel / cfg.zombie.speed_mps);
         w.flag(env.map.house_at(z.pos).is_some());
         w.flag(true);
-        w.push(d / size);
+        w.push(d.min(NEAR_M) / NEAR_M);
         w.flag(env.human_sees(z.pos));
     }
     w.end_block(start, MAX_ZOMBIES * 8);
@@ -260,7 +295,7 @@ pub fn write_state(env: &Env, out: &mut [f32]) {
     // Food (128 x 4).
     let start = w.i;
     for f in &env.food {
-        w.vec(f.pos / size);
+        w.vec(f.pos / FAR_M);
         w.flag(f.active);
         w.flag(env.map.house_at(f.pos).is_some());
     }
@@ -269,10 +304,10 @@ pub fn write_state(env: &Env, out: &mut [f32]) {
     // Houses (10 x 10).
     let start = w.i;
     for house in &env.map.houses {
-        w.vec(house.center / size);
+        w.vec(house.center / FAR_M);
         w.vec(angle_sin_cos(house.axis_x));
-        w.vec(house.doors[0].center / size);
-        w.vec(house.doors[1].center / size);
+        w.vec(house.doors[0].center / FAR_M);
+        w.vec(house.doors[1].center / FAR_M);
         w.flag(house.doors[0].closed);
         w.flag(house.doors[1].closed);
     }
@@ -280,9 +315,9 @@ pub fn write_state(env: &Env, out: &mut [f32]) {
 
     // Time features (4).
     w.push(env.time / cfg.episode_cap_s);
+    w.push((cfg.episode_cap_s - env.time) / TIME_SCALE_S);
     w.push(env.zombies.len() as f32 / MAX_ZOMBIES as f32);
     w.push(env.food.iter().filter(|f| f.active).count() as f32 / MAX_FOOD as f32);
-    w.push(1.0);
     w.finish();
 }
 
@@ -327,6 +362,10 @@ pub const HUMAN_LAYOUT: [Block; 5] = [
         &[
             "x",
             "y",
+            "wall_w",
+            "wall_e",
+            "wall_s",
+            "wall_n",
             "heading_sin",
             "heading_cos",
             "vx",
@@ -345,23 +384,25 @@ pub const HUMAN_LAYOUT: [Block; 5] = [
     ),
     block(
         "zombies",
-        16,
+        20,
         MAX_VISIBLE_ZOMBIES,
         &["dx", "dy", "dist", "vx", "vy", "valid"],
     ),
     block(
         "food",
-        208,
+        212,
         MAX_VISIBLE_FOOD,
         &["dx", "dy", "dist", "valid"],
     ),
     block(
         "houses",
-        272,
+        276,
         MAX_HOUSES,
         &[
+            "valid",
             "dx",
             "dy",
+            "dist",
             "rot_sin",
             "rot_cos",
             "front_dx",
@@ -374,7 +415,7 @@ pub const HUMAN_LAYOUT: [Block; 5] = [
             "inside",
         ],
     ),
-    block("rays", 392, HUMAN_RAYS, &["dist", "wall", "closed_door"]),
+    block("rays", 416, HUMAN_RAYS, &["dist", "wall", "closed_door"]),
 ];
 
 /// Layout of a zombie observation (see `write_zombie_obs`).
@@ -386,6 +427,10 @@ pub const ZOMBIE_LAYOUT: [Block; 5] = [
         &[
             "x",
             "y",
+            "wall_w",
+            "wall_e",
+            "wall_s",
+            "wall_n",
             "heading_sin",
             "heading_cos",
             "vx",
@@ -394,13 +439,13 @@ pub const ZOMBIE_LAYOUT: [Block; 5] = [
             "blocked",
             "since_heard",
             "num_zombies",
-            "time",
+            "time_left",
             "bias",
         ],
     ),
     block(
         "heard",
-        12,
+        16,
         crate::env::HEARD_CAPACITY,
         &[
             "dx", "dy", "dist", "walk", "pickup", "door", "age", "fresh", "valid",
@@ -408,19 +453,20 @@ pub const ZOMBIE_LAYOUT: [Block; 5] = [
     ),
     block(
         "peers",
-        84,
+        88,
         MAX_PEERS,
         &["dx", "dy", "dist", "same_house", "valid"],
     ),
     block(
         "houses",
-        124,
+        128,
         MAX_HOUSES,
         &[
-            "dx", "dy", "rot_sin", "rot_cos", "front_dx", "front_dy", "back_dx", "back_dy",
+            "valid", "dx", "dy", "dist", "rot_sin", "rot_cos", "front_dx", "front_dy", "back_dx",
+            "back_dy",
         ],
     ),
-    block("rays", 204, ZOMBIE_RAYS, &["dist", "wall", "closed_door"]),
+    block("rays", 228, ZOMBIE_RAYS, &["dist", "wall", "closed_door"]),
 ];
 
 /// Layout of the global critic state (see `write_state`).
@@ -471,7 +517,7 @@ pub const STATE_LAYOUT: [Block; 5] = [
         "time",
         1140,
         1,
-        &["time", "num_zombies", "active_food", "bias"],
+        &["time", "time_left", "num_zombies", "active_food"],
     ),
 ];
 
@@ -503,6 +549,75 @@ mod layout_tests {
         check(&HUMAN_LAYOUT, HUMAN_OBS_DIM);
         check(&ZOMBIE_LAYOUT, ZOMBIE_OBS_DIM);
         check(&STATE_LAYOUT, STATE_DIM);
+    }
+
+    #[test]
+    fn v2_distances_do_not_depend_on_the_map_size() {
+        // The same arrangement relative to a house, on a small and on the PRD map.
+        let mut values = Vec::new();
+        for size in [75.0, 500.0] {
+            let cfg = Config {
+                map_size_m: size,
+                house_count: 1,
+                zombie_count: 1,
+                food_count: 1,
+                ..Config::default()
+            };
+            let mut env = Env::new(cfg, 5).unwrap();
+            let house = env.map.houses[0].center;
+            env.human.pos = house + Vec2::new(0.0, 30.0);
+            env.zombies[0].pos = env.human.pos + Vec2::new(40.0, 0.0);
+            let mut h = vec![0.0; HUMAN_OBS_DIM];
+            write_human_obs(&env, &mut h);
+            let f = |b: &str, s: usize, n: &str| field(&HUMAN_LAYOUT, &h, b, s, n);
+            assert_eq!(f("houses", 0, "valid"), 1.0);
+            assert_eq!(f("houses", 1, "valid"), 0.0);
+            assert!(
+                (f("houses", 0, "dy") + 0.3).abs() < 1e-5,
+                "linear below 100 m"
+            );
+            assert!((f("houses", 0, "dist") - 30.0 / 500.0).abs() < 1e-5);
+            assert!((f("self", 0, "x") - env.human.pos.x / 500.0).abs() < 1e-6);
+            let west = env.human.pos.x.min(100.0) / 100.0;
+            assert!((f("self", 0, "wall_w") - west).abs() < 1e-6);
+            let mut s = vec![0.0; STATE_DIM];
+            write_state(&env, &mut s);
+            let k = |b: &str, sl: usize, n: &str| field(&STATE_LAYOUT, &s, b, sl, n);
+            assert!((k("zombies", 0, "dist_to_human") - 0.4).abs() < 1e-5);
+            values.push((
+                f("houses", 0, "dx"),
+                f("houses", 0, "dy"),
+                f("houses", 0, "dist"),
+            ));
+        }
+        let (a, b) = (values[0], values[1]);
+        assert!((a.0 - b.0).abs() + (a.1 - b.1).abs() + (a.2 - b.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn v2_far_landmarks_keep_direction_and_distance() {
+        let cfg = Config {
+            house_count: 1,
+            zombie_count: 1,
+            food_count: 1,
+            ..Config::default()
+        };
+        let mut env = Env::new(cfg, 5).unwrap();
+        let house = env.map.houses[0].center;
+        let offset = if house.x > 250.0 { -300.0 } else { 300.0 };
+        env.human.pos = house + Vec2::new(offset, 0.0);
+        let mut z = vec![0.0; ZOMBIE_OBS_DIM];
+        env.zombies[0].pos = env.human.pos;
+        write_zombie_obs(&env, 0, &mut z);
+        let g = |b: &str, s: usize, n: &str| field(&ZOMBIE_LAYOUT, &z, b, s, n);
+        assert!(
+            (g("houses", 0, "dx") + offset.signum()).abs() < 1e-5,
+            "unit direction"
+        );
+        assert!(g("houses", 0, "dy").abs() < 1e-5);
+        assert!((g("houses", 0, "dist") - 300.0 / 500.0).abs() < 1e-5);
+        let left = (env.cfg.episode_cap_s - env.time) / 1200.0;
+        assert!((g("self", 0, "time_left") - left).abs() < 1e-6);
     }
 
     #[test]
@@ -560,6 +675,8 @@ mod layout_tests {
         assert_eq!(k("zombies", 2, "valid"), 0.0);
         assert_eq!(k("zombies", 1, "sees_human"), 1.0);
         assert_eq!(k("food", 0, "active"), 1.0);
-        assert_eq!(k("time", 0, "bias"), 1.0);
+        assert!(
+            (k("time", 0, "time_left") - (env.cfg.episode_cap_s - env.time) / 1200.0).abs() < 1e-6
+        );
     }
 }

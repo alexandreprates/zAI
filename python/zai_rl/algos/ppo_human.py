@@ -18,7 +18,14 @@ from torch import nn
 from ..envs import HumanBatch, HumanTrainingEnv
 from ..models import HumanActor, HumanCritic
 from ..profiling import timer
-from .common import EpisodeStats, RunningMeanStd, bptt_sequences, gae, save_checkpoint
+from .common import (
+    EpisodeStats,
+    RunningMeanStd,
+    bptt_sequences,
+    gae,
+    require_obs_version,
+    save_checkpoint,
+)
 
 __all__ = [
     "EpisodeStats",
@@ -241,9 +248,11 @@ class HumanPPO:
             "value_rms": self.value_rms.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "ppo_config": asdict(self.cfg),
+            "obs_version": self.actor.obs_version,
         }
 
     def load_state_dict(self, sd: dict[str, Any]) -> None:
+        require_obs_version(sd, self.actor.obs_version, "the checkpoint")
         self.actor.load_state_dict(sd["actor"])
         self.critic.load_state_dict(sd["critic"])
         self.value_rms.load_state_dict(sd["value_rms"])

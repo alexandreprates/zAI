@@ -160,7 +160,6 @@ class ZombieTrainingEnv:
             agent_env.append(np.repeat(np.arange(size) + env_offset, n))
             env_offset += size
         self.num_envs = num_envs
-        self.map_size_m = float(config["map_size_m"])
         self.agent_env = np.concatenate(agent_env)
         self.num_agents = len(self.agent_env)
         self._human: list[tuple[np.ndarray, np.ndarray]] = []

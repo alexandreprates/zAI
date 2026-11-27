@@ -147,14 +147,18 @@ def main() -> None:
     n = config["zombie_count"]
     human_policy = (
         RecurrentHumanPolicy.from_checkpoint(
-            args.human_checkpoint, num_envs=1, deterministic=args.deterministic
+            args.human_checkpoint, num_envs=1, deterministic=args.deterministic, config=config
         )
         if args.human_checkpoint
         else None
     )
     zombie_policy = (
         RecurrentZombiePolicy.from_checkpoint(
-            args.zombie_checkpoint, num_envs=1, num_zombies=n, deterministic=args.deterministic
+            args.zombie_checkpoint,
+            num_envs=1,
+            num_zombies=n,
+            deterministic=args.deterministic,
+            config=config,
         )
         if args.zombie_checkpoint
         else None

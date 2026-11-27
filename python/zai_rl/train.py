@@ -28,6 +28,7 @@ from arena.export_replays import record_training_replays, training_replay_dir
 from arena.matches import play
 from zai_env.config import deep_merge, load_config
 
+from .algos.common import require_obs_version
 from .algos.ppo_human import EpisodeStats, HumanPPO, PPOConfig, save_checkpoint
 from .bots import ScriptedHuman, ScriptedZombies
 from .envs import HumanTrainingEnv
@@ -103,7 +104,9 @@ def zombie_opponent(cfg: TrainConfig, device: torch.device):
     if cfg.opponent != "policy" or not cfg.zombie_checkpoint:
         raise ValueError("opponent must be 'scripted', or 'policy' with a zombie_checkpoint")
     path = resolve(cfg.zombie_checkpoint)
-    return lambda c, e, n, s: RecurrentZombiePolicy.from_checkpoint(path, e, n, str(device))
+    return lambda c, e, n, s: RecurrentZombiePolicy.from_checkpoint(
+        path, e, n, str(device), config=c
+    )
 
 
 def evaluate(
@@ -173,6 +176,7 @@ def main() -> None:
     iteration, steps = 0, 0
     if cfg.init_checkpoint and not args.resume:
         sd = torch.load(resolve(cfg.init_checkpoint), map_location=device, weights_only=False)
+        require_obs_version(sd, algo.actor.obs_version, f"init_checkpoint {cfg.init_checkpoint}")
         algo.actor.load_state_dict(sd["actor"])
         algo.critic.load_state_dict(sd["critic"])
         algo.value_rms.load_state_dict(sd["value_rms"])

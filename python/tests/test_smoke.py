@@ -7,7 +7,8 @@ def test_zai_sim_extension_loads():
     import zai_sim
 
     assert zai_sim.__version__ == "0.1.0"
-    assert (zai_sim.HUMAN_OBS_DIM, zai_sim.ZOMBIE_OBS_DIM, zai_sim.STATE_DIM) == (584, 252, 1144)
+    assert (zai_sim.HUMAN_OBS_DIM, zai_sim.ZOMBIE_OBS_DIM, zai_sim.STATE_DIM) == (608, 276, 1144)
+    assert zai_sim.OBS_VERSION == 2
 
 
 @pytest.mark.parametrize("package", ["zai_env", "zai_rl", "zai_rl.bots", "zai_agent", "arena"])

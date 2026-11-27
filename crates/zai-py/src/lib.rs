@@ -607,6 +607,10 @@ impl VecEnv {
 #[pymodule]
 fn zai_sim(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", ::zai_sim::VERSION)?;
+    m.add("OBS_VERSION", ::zai_sim::OBS_VERSION)?;
+    m.add("OBS_NEAR_M", ::zai_sim::obs::NEAR_M)?;
+    m.add("OBS_FAR_M", ::zai_sim::obs::FAR_M)?;
+    m.add("OBS_TIME_SCALE_S", ::zai_sim::obs::TIME_SCALE_S)?;
     m.add("HUMAN_OBS_DIM", HUMAN_OBS_DIM)?;
     m.add("ZOMBIE_OBS_DIM", ZOMBIE_OBS_DIM)?;
     m.add("STATE_DIM", STATE_DIM)?;

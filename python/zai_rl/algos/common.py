@@ -79,6 +79,22 @@ class Checkpointable(Protocol):
     def state_dict(self) -> dict[str, Any]: ...
 
 
+def checkpoint_obs_version(sd: dict[str, Any]) -> int:
+    """Observation layout a checkpoint was trained on (checkpoints before M6.1 have none: v1)."""
+    return int(sd.get("obs_version", 1))
+
+
+def require_obs_version(sd: dict[str, Any], expected: int, what: str) -> None:
+    """Fails when `sd` was trained on another observation layout than `expected`."""
+    found = checkpoint_obs_version(sd)
+    if found != expected:
+        raise ValueError(
+            f"{what} was trained on observation layout v{found}, this code uses v{expected}; "
+            "layout v1 checkpoints can only play as frozen policies (zai_env.legacy) or be "
+            "distilled (python -m zai_rl.distill)"
+        )
+
+
 def save_checkpoint(path: Path, algo: Checkpointable, extra: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")

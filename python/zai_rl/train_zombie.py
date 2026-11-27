@@ -35,12 +35,12 @@ from arena.export_replays import record_training_replays, training_replay_dir
 from arena.matches import MatchStats, play
 from zai_env.config import deep_merge, load_config
 
-from .algos.common import EpisodeStats, save_checkpoint
+from .algos.common import EpisodeStats, require_obs_version, save_checkpoint
 from .algos.mappo_zombie import MAPPOConfig, ZombieMAPPO
 from .bots import RandomHuman, RandomZombies, ScriptedHuman, ScriptedZombies
 from .envs import HumanFactory, ZombieFactory, ZombieTrainingEnv
 from .metrics import MetricsLogger
-from .policy import RecurrentHumanPolicy, RecurrentZombiePolicy
+from .policy import RecurrentHumanPolicy, RecurrentZombiePolicy, load_human_actor
 from .profiling import maybe_trace, rollout_split, timer
 from .train import OUTCOME_KEYS, resolve
 
@@ -105,8 +105,8 @@ def human_bot(kind: str) -> HumanFactory:
 
 def frozen_human(path: Path, device: torch.device) -> HumanFactory:
     """Factory of recurrent policies sharing one frozen human actor loaded from `path`."""
-    actor = RecurrentHumanPolicy.from_checkpoint(path, num_envs=1, device=str(device)).actor
-    return lambda c, e, s: RecurrentHumanPolicy(actor, e, device)
+    actor = load_human_actor(path, device)
+    return lambda c, e, s: RecurrentHumanPolicy(actor, e, device, config=c)
 
 
 def human_opponent(cfg: "ZombieTrainConfig", device: torch.device) -> HumanFactory:
@@ -197,6 +197,7 @@ def main() -> None:
     iteration, steps = 0, 0
     if cfg.init_checkpoint and not args.resume:
         sd = torch.load(resolve(cfg.init_checkpoint), map_location=device, weights_only=False)
+        require_obs_version(sd, algo.actor.obs_version, f"init_checkpoint {cfg.init_checkpoint}")
         algo.actor.load_state_dict(sd["actor"])
         algo.critic.load_state_dict(sd["critic"])
         algo.value_rms.load_state_dict(sd["value_rms"])

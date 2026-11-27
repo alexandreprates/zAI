@@ -37,7 +37,7 @@ The user's shell exports `DOCKER_DEFAULT_PLATFORM=linux/amd64`; the `Makefile` u
 ## Simulation core (`crates/zai-sim`)
 
 - `Env` (`env.rs`) is one deterministic match: `step(HumanAction, &[u8])` runs one decision (`action_repeat` = 5 physics ticks of 0.1 s). Order inside a step: human interaction (pickup / close door, masked actions are no-ops), then ticks (movement with wall sliding, zombie soft push, contact check, hunger, food respawn), then the walking noise, noise routing to zombies, truncation, perception update, rewards.
-- `map.rs` holds houses (6 wall segments + 2 door segments each) and the geometric queries (line of sight, ray casts, clearance) culled per house. `obs.rs` writes the fixed-size observation vectors whose layouts are specified in `docs/ARCHITECTURE.md` section 3.6; keep both in sync.
+- `map.rs` holds houses (6 wall segments + 2 door segments each) and the geometric queries (line of sight, ray casts, clearance) culled per house. `obs.rs` writes the fixed-size observation vectors (layout v2, `OBS_VERSION`, specified in `docs/ARCHITECTURE.md` section 4.8.2; section 3.6 describes v1); keep both in sync. v2 divides distances by constants (`NEAR_M`, `FAR_M`, `TIME_SCALE_S`), not by the map size.
 - Rule tests live in `src/tests/` (crate-internal so they can arrange exact states via `pub(crate)` fields): `rules.rs` has one test per PRD rule, `props.rs` has proptest invariants (no wall penetration or tunneling, determinism by `state_hash`).
 - `Config` defaults are the PRD values (curriculum stage S2); `ZAI_ZOMBIE_COUNT` / `ZAI_FOOD_COUNT` apply through `Config::with_env_overrides`.
 
@@ -45,7 +45,8 @@ The user's shell exports `DOCKER_DEFAULT_PLATFORM=linux/amd64`; the `Makefile` u
 
 - `zai_sim` (PyO3 module from `crates/zai-py`): `Env` (single match) and `VecEnv` (rayon-parallel, GIL released, auto-reset, writes into preallocated NumPy arrays that are reused and overwritten on every call; `info["final_*"]` holds the last observation of finished episodes). Per-episode seeds come from `episode_seed(base, env_index, episode)`, which the parity test relies on.
 - Configs cross into Rust as JSON; `zai_env.config.load_config` merges defaults <- YAML <- overrides <- env vars and Rust validates (unknown keys are errors). Do not duplicate the schema in Python.
-- Never hardcode observation indices in Python: use `zai_env.layout` (`HUMAN`, `ZOMBIE`, `STATE`), built from the layout tables in `crates/zai-sim/src/obs.rs`.
+- Never hardcode observation indices in Python: use `zai_env.layout` (`HUMAN`, `ZOMBIE`, `STATE`, `house_deltas_m`), built from the layout tables in `crates/zai-sim/src/obs.rs`.
+- Checkpoints store `obs_version` (missing means v1). v1 actors (`HumanActor(obs_version=1)`) play as frozen policies through `zai_env.legacy.adapt_v1_*` (pass `config=` to `Recurrent*Policy.from_checkpoint`); training, resume, `init_checkpoint` and ONNX export refuse them. `tests/test_legacy.py` replays `tests/fixtures/obs_v1.npz` (recorded from the v1 encoders) to check the adapter, the dynamics and the bots.
 - `zai_rl.bots` holds the vectorized scripted/random policies; `arena.matches.play` runs batched bot-vs-bot matches (first episode per env only).
 - `make test` builds the extension with `maturin develop --release`; Python tests include a VecEnv-vs-Env parity test and the PettingZoo API tests.
 

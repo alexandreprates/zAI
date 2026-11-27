@@ -57,6 +57,8 @@ export interface ModelInfo {
   stage: string;
   hidden: number;
   obs_dim: number;
+  /** Observation layout the model was trained on (1 before M6.1). */
+  obs_version: number;
   created_at: number;
   config: Record<string, unknown>;
 }

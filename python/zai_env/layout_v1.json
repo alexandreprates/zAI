@@ -1,0 +1,223 @@
+{
+ "human": {
+  "self": {
+   "start": 0,
+   "slots": 1,
+   "fields": [
+    "x",
+    "y",
+    "heading_sin",
+    "heading_cos",
+    "vx",
+    "vy",
+    "carried",
+    "carried_0",
+    "carried_1",
+    "carried_2",
+    "carried_3",
+    "carried_4",
+    "carried_5",
+    "hunger",
+    "inside",
+    "since_noise"
+   ]
+  },
+  "zombies": {
+   "start": 16,
+   "slots": 32,
+   "fields": [
+    "dx",
+    "dy",
+    "dist",
+    "vx",
+    "vy",
+    "valid"
+   ]
+  },
+  "food": {
+   "start": 208,
+   "slots": 16,
+   "fields": [
+    "dx",
+    "dy",
+    "dist",
+    "valid"
+   ]
+  },
+  "houses": {
+   "start": 272,
+   "slots": 10,
+   "fields": [
+    "dx",
+    "dy",
+    "rot_sin",
+    "rot_cos",
+    "front_dx",
+    "front_dy",
+    "back_dx",
+    "back_dy",
+    "front_closed",
+    "back_closed",
+    "door_visible",
+    "inside"
+   ]
+  },
+  "rays": {
+   "start": 392,
+   "slots": 64,
+   "fields": [
+    "dist",
+    "wall",
+    "closed_door"
+   ]
+  }
+ },
+ "zombie": {
+  "self": {
+   "start": 0,
+   "slots": 1,
+   "fields": [
+    "x",
+    "y",
+    "heading_sin",
+    "heading_cos",
+    "vx",
+    "vy",
+    "inside",
+    "blocked",
+    "since_heard",
+    "num_zombies",
+    "time",
+    "bias"
+   ]
+  },
+  "heard": {
+   "start": 12,
+   "slots": 8,
+   "fields": [
+    "dx",
+    "dy",
+    "dist",
+    "walk",
+    "pickup",
+    "door",
+    "age",
+    "fresh",
+    "valid"
+   ]
+  },
+  "peers": {
+   "start": 84,
+   "slots": 8,
+   "fields": [
+    "dx",
+    "dy",
+    "dist",
+    "same_house",
+    "valid"
+   ]
+  },
+  "houses": {
+   "start": 124,
+   "slots": 10,
+   "fields": [
+    "dx",
+    "dy",
+    "rot_sin",
+    "rot_cos",
+    "front_dx",
+    "front_dy",
+    "back_dx",
+    "back_dy"
+   ]
+  },
+  "rays": {
+   "start": 204,
+   "slots": 16,
+   "fields": [
+    "dist",
+    "wall",
+    "closed_door"
+   ]
+  }
+ },
+ "state": {
+  "human": {
+   "start": 0,
+   "slots": 1,
+   "fields": [
+    "x",
+    "y",
+    "vx",
+    "vy",
+    "carried",
+    "hunger",
+    "house_0",
+    "house_1",
+    "house_2",
+    "house_3",
+    "house_4",
+    "house_5",
+    "house_6",
+    "house_7",
+    "house_8",
+    "house_9"
+   ]
+  },
+  "zombies": {
+   "start": 16,
+   "slots": 64,
+   "fields": [
+    "x",
+    "y",
+    "vx",
+    "vy",
+    "inside",
+    "valid",
+    "dist_to_human",
+    "sees_human"
+   ]
+  },
+  "food": {
+   "start": 528,
+   "slots": 128,
+   "fields": [
+    "x",
+    "y",
+    "active",
+    "inside"
+   ]
+  },
+  "houses": {
+   "start": 1040,
+   "slots": 10,
+   "fields": [
+    "x",
+    "y",
+    "rot_sin",
+    "rot_cos",
+    "front_x",
+    "front_y",
+    "back_x",
+    "back_y",
+    "front_closed",
+    "back_closed"
+   ]
+  },
+  "time": {
+   "start": 1140,
+   "slots": 1,
+   "fields": [
+    "time",
+    "num_zombies",
+    "active_food",
+    "bias"
+   ]
+  }
+ },
+ "dims": {
+  "human": 584,
+  "zombie": 252,
+  "state": 1144
+ }
+}
