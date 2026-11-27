@@ -75,7 +75,7 @@ class OpponentSlots:
         self.env_slot = np.full(env.num_envs, -1)
         self.env_entry: dict[int, str] = {}
         for k in range(1, len(self.slots)):
-            self._load(k, pool.sample(self.learner, rng), 0)
+            self._load(k, pool.sample(self.learner, rng, set(self.resident())), 0)
         for e in self.envs:
             self._assign(int(e))
 
@@ -133,7 +133,11 @@ class OpponentSlots:
                 self.slots[oldest].draining = True
         for k, s in enumerate(self.slots):
             if k > 0 and (s.entry is None or s.draining) and not s.envs:
-                self._load(k, self.pool.sample(self.learner, self.rng), iteration)
+                avoid = {e for j, e in enumerate(self._ids()) if j != k}
+                self._load(k, self.pool.sample(self.learner, self.rng, avoid), iteration)
+
+    def _ids(self) -> list[str | None]:
+        return [s.entry.id if s.entry is not None else None for s in self.slots]
 
     def resident(self) -> list[str]:
         return [s.entry.id for s in self.slots if s.entry is not None]

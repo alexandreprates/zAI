@@ -1,3 +1,4 @@
+import json
 import sys
 
 import numpy as np
@@ -184,7 +185,9 @@ def test_tiny_league_trains_snapshots_and_resumes(tiny_cfg, tmp_path, monkeypatc
     assert state2["pool"]["snapshots"]["zombie"] >= state["pool"]["snapshots"]["zombie"]
 
 
-@pytest.mark.parametrize("name", ["league_cpu.yaml", "league_s0small_gpu.yaml"])
+@pytest.mark.parametrize(
+    "name", ["league_cpu.yaml", "league_s0small_gpu.yaml", "league_m6_gpu.yaml"]
+)
 def test_league_configs_load(name):
     from zai_env.config import config_dir as env_dir
     from zai_rl.train_league import LeagueConfig
@@ -198,3 +201,104 @@ def test_league_configs_load(name):
             if g.kind in "AB"
         ]
     )
+
+
+def test_gate_margins_follow_the_baselines_and_skip_disabled_conditions():
+    import math
+
+    from zai_rl.league.gates import GateInputs, GateSpec, GateTracker, margins
+
+    spec = GateSpec(
+        survived_min=0.6,
+        survived_over_baseline=0.1,
+        caught_times_baseline=3,
+        caught_over_baseline=0.15,
+        caught_ci_above_baseline=True,
+        elo_gain=None,
+        probe_gap_max=0.2,
+        consecutive=2,
+    )
+    x = GateInputs(
+        survived=0.75,
+        caught=0.20,
+        caught_lo=0.17,
+        baseline_survived=0.62,
+        baseline_caught=0.043,
+        baseline_caught_hi=0.06,
+        s_z=0.5,
+        forgetting={"human": 0.6, "zombie": math.nan},
+        probe_gap={"human": 0.1},
+    )
+    m = margins(spec, x)
+    assert abs(m["survived"] - (0.75 - 0.72)) < 1e-9
+    assert abs(m["caught"] - (0.20 - 0.193)) < 1e-9
+    assert "elo_human" not in m
+    assert math.isnan(m["probe_zombie"]), "missing probe fails"
+    t = GateTracker(spec)
+    assert not t.update(x) and "probe_zombie" in t.failing()
+    x.probe_gap["zombie"] = 0.05
+    assert not t.update(x)  # first passing evaluation
+    assert t.update(x) and t.scalars()["gate/passed"] == 1.0
+
+
+def test_league_advances_through_stages_when_the_gate_passes(tiny_cfg, tmp_path, monkeypatch):
+    s0 = dict(tiny_cfg)
+    path_a = tmp_path / "a.yaml"
+    path_a.write_text(yaml.safe_dump(tiny_cfg))
+    path_b = tmp_path / "b.yaml"
+    path_b.write_text(yaml.safe_dump({**s0, "map_size_m": 100.0}))
+    open_gate = {
+        "balance": [0.0, 1.0],
+        "forgetting_min": 0.0,
+        "elo_gain": None,
+        "probe_gap_max": None,
+        "consecutive": 1,
+    }
+    cfg = {
+        "num_envs": 8,
+        "zombie_counts": [2],
+        "total_steps": 100 * 16 * 8,
+        "num_threads": 1,
+        "device": "cpu",
+        "eval_every": 0,
+        "gate_every": 2,
+        "gate_episodes": 2,
+        "checkpoint_every": 100,
+        "stages": [
+            {
+                "name": "a",
+                "env_config": str(path_a),
+                "zombie_counts": [2],
+                "min_steps": 0,
+                "max_steps": 10 * 16 * 8,
+                "gate": open_gate,
+            },
+            {
+                "name": "b",
+                "env_config": str(path_b),
+                "zombie_counts": [2, 3],
+                "max_steps": 2 * 16 * 8,
+            },
+        ],
+        "league": {"guard_window": 1, "snapshot_every_steps": 10**9},
+        "human": {"rollout": 16, "bptt": 8, "minibatches": 2, "epochs": 1, "hidden": 16},
+        "zombie": {"rollout": 16, "bptt": 8, "minibatches": 2, "epochs": 1, "hidden": 16},
+    }
+    cfg_path = tmp_path / "league.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg))
+    monkeypatch.setenv("ZAI_CHECKPOINT_DIR", str(tmp_path / "ckpt"))
+    monkeypatch.setenv("ZAI_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.delenv("ZAI_DATA_DIR", raising=False)
+    monkeypatch.delenv("ZAI_SERVER_URL", raising=False)
+    monkeypatch.setattr(sys, "argv", ["league", "--config", str(cfg_path), "--run-id", "st"])
+    main()
+    state = torch.load(tmp_path / "ckpt" / "league" / "st" / "league.pt", weights_only=False)
+    assert state["stage_index"] == 1
+    assert [h["result"] for h in state["history"]] == ["passed", "completed"]
+    assert state["history"][0]["end"] == 2 * 16 * 8, "the gate passed at its first check"
+    assert state["steps"] == 4 * 16 * 8
+    finals = [e["id"] for e in state["pool"]["entries"]["human"] if e["source"] == "stage_final"]
+    assert finals == ["human-a-final"], "the pool restarts from the previous stage's finals"
+    assert state["starters"]["zombie"] == "zombie-a-final"
+    pool = json.loads((tmp_path / "ckpt" / "league" / "st" / "pool.json").read_text())
+    assert pool["stage"]["name"] == "b" and pool["stage"]["zombie_counts"] == [2, 3]

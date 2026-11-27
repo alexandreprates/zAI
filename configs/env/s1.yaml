@@ -1,0 +1,15 @@
+# Curriculum stage S1 for M6 (docs/ARCHITECTURE.md sections 4.4 and 4.8.1, decision D8): a 300 m
+# map with 6 houses and 45 food packages (the S2 food density of 120 per 500 x 500 m), a 75 m
+# spawn distance and 10 min episodes. Training samples 8/12/16 zombies (the league's
+# `zombie_counts`); this value is the one used for evaluation. Shaping stays on (the planned
+# anneal over the last 40% of the stage is not implemented yet).
+map_size_m: 300.0
+house_count: 6
+zombie_count: 12
+food_count: 45
+episode_cap_s: 600.0
+min_spawn_distance_m: 75.0
+reward:
+  human_food_shaping: 1.0
+  zombie_distance_shaping: 0.5
+  zombie_step_penalty: 0.0

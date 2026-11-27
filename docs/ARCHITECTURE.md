@@ -401,6 +401,8 @@ Status: accepted (2026-11-27) with the recommended option of every decision in 4
 
 #### 4.8.1 Starting stage and curriculum gates
 
+**Status (2026-11-27): implemented** in `zai_rl/league/gates.py` (`GateSpec`, margins per condition, `GateTracker`) and the stage loop of `zai_rl/train_league.py` (`StageSpec`, `League.advance`), full-run config `configs/train/league_m6_gpu.yaml`, new `configs/env/s1.yaml`. Gate inputs: anchors and baselines measured by the trainer (`gate_episodes` per count), `s_z` of the last guard window, forgetting from the pool's decayed training scores against this stage's snapshots older than 40 M steps, Elo from the arena's `arena.json` of the same stage (latest vs the stage starter), probe gaps from `probes.jsonl`. Probes run at a gate check only once every other condition passes and the stage's last probe is older than 50 M steps, since each takes about 20 min per side. Not implemented: the S1 shaping anneal. The arena follows the stage from `pool.json` and keeps one cross-play table per stage.
+
 M6 starts on `s0_small`, the only stage where both sides have competent learned policies (4.6, 4.7). The S0 zombie gate of section 4.4 (catch the scripted human > 60%) is not reachable as written: on S0 the best learned zombies caught the scripted human in 1-3.6% of episodes against a 4.3% scripted baseline with 2-4 zombies, and 4.7 showed that even on `s0_small` the team needed 8-10 zombies to beat a learned human. The gates are therefore relative to baselines measured at the start of each stage on the same seeds (as M5 acceptance was), and S0 is trained with more zombies.
 
 | Stage | Env config | Zombie counts (equal groups) | Budget (min / max env steps) | Starts from |

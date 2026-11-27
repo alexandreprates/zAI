@@ -149,9 +149,16 @@ class Pool:
     def _f(self, p: float) -> float:
         return (1.0 - p) ** 2 if self.pfsp == "hard" else p * (1.0 - p)
 
-    def sample(self, learner: str, rng: np.random.Generator) -> Entry | None:
-        """A non-scripted opponent entry for `learner`, or None if the pool has none."""
+    def sample(
+        self, learner: str, rng: np.random.Generator, avoid: set[str] | None = None
+    ) -> Entry | None:
+        """A non-scripted opponent entry for `learner`, or None if the pool has none; entries in
+        `avoid` (already resident) are skipped unless nothing else is left."""
         w = self.weights(learner)
+        if avoid and any(k not in avoid for k in w):
+            w = {k: v for k, v in w.items() if k not in avoid}
+            total = sum(w.values())
+            w = {k: v / total for k, v in w.items()}
         if not w:
             return None
         ids = list(w)
@@ -199,8 +206,9 @@ class Pool:
             ]
         return out
 
-    def write_summary(self, path: Path) -> None:
+    def write_summary(self, path: Path, extra: dict[str, Any] | None = None) -> None:
+        """Writes `pool.json` (the summary plus `extra`, e.g. the current stage)."""
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.summary(), indent=1))
+        tmp.write_text(json.dumps({**self.summary(), **(extra or {})}, indent=1))
         tmp.replace(path)

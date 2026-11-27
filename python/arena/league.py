@@ -35,6 +35,7 @@ from .tactics import tactic_metrics
 log = logging.getLogger("arena.league")
 
 SCRIPTED_ZOMBIES = "zombie-scripted"
+DEFAULT_STAGE = "default"  # cross-play rows of leagues without stages
 RANDOM = {"human": "human-random", "zombie": "zombie-random"}
 
 
@@ -65,14 +66,40 @@ class Arena:
         self.env_cfg = load_config(Path(cfg.env_config), env_overrides=False)
         self.device = torch.device(cfg.device)
         self.metrics = metrics
+        # Results of the current stage by (human, zombie); every stage's rows in `rows`.
         self.results: dict[tuple[str, str], dict[str, Any]] = {}
+        self.rows: list[dict[str, Any]] = []
+        self.stage = DEFAULT_STAGE
         self.actors: dict[str, Any] = {}
         self.posted_for: tuple[str, str] | None = None
         path = cfg.league_dir / "crossplay.jsonl"
         if path.is_file():
-            for line in path.read_text().splitlines():
-                r = json.loads(line)
-                self.results[(r["human"], r["zombie"])] = r
+            self.rows = [json.loads(line) for line in path.read_text().splitlines()]
+        self._index()
+
+    def _index(self) -> None:
+        self.results = {
+            (r["human"], r["zombie"]): r
+            for r in self.rows
+            if r.get("stage", DEFAULT_STAGE) == self.stage
+        }
+
+    def set_stage(self, pool: dict[str, Any]) -> None:
+        """Follows the league's current stage (`pool.json` `stage`): its env config and zombie
+        counts, and a separate cross-play table, since ratings do not carry across maps."""
+        from zai_rl.train import resolve
+
+        st = pool.get("stage")
+        name = st["name"] if st else DEFAULT_STAGE
+        if name == self.stage:
+            return
+        self.stage = name
+        if st:
+            self.env_cfg = load_config(resolve(st["env_config"]), env_overrides=False)
+            self.cfg.zombie_counts = list(st["zombie_counts"])
+        self.posted_for = None
+        self._index()
+        log.info("stage %s: %d matchups already played", name, len(self.results))
 
     # --- entries ------------------------------------------------------------------------
     def elo_set(self, pool: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -159,6 +186,7 @@ class Arena:
 
     def round(self, pool: dict[str, Any]) -> int:
         """Plays every missing matchup of the Elo set; returns how many were played."""
+        self.set_stage(pool)
         sets = self.elo_set(pool)
         played = 0
         path = self.cfg.league_dir / "crossplay.jsonl"
@@ -169,7 +197,9 @@ class Arena:
                     continue
                 t0 = time.time()
                 row, _ = self.play(h, z)
+                row["stage"] = self.stage
                 self.results[key] = row
+                self.rows.append(row)
                 with path.open("a") as f:
                     f.write(json.dumps(row) + "\n")
                 played += 1
@@ -184,6 +214,7 @@ class Arena:
 
     # --- ratings and reports ------------------------------------------------------------
     def report(self, pool: dict[str, Any]) -> dict[str, Any]:
+        self.set_stage(pool)
         sets = self.elo_set(pool)
         rows = list(self.results.values())
         matchups = [Matchup(r["human"], r["zombie"], r["episodes"], r["score"]) for r in rows]
@@ -215,6 +246,7 @@ class Arena:
         }
         return {
             "run_id": self.cfg.run_id,
+            "stage": self.stage,
             "updated": time.time(),
             "anchor": SCRIPTED_ZOMBIES,
             "entries": entries,

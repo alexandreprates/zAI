@@ -20,8 +20,11 @@ Outputs: learner checkpoints where the single-side trainers write them
 """
 
 import argparse
+import json
 import logging
 import os
+import subprocess
+import sys
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
@@ -43,6 +46,7 @@ from .algos.mappo_zombie import MAPPOConfig, ZombieMAPPO, ZombieRollout
 from .algos.ppo_human import HumanPPO, HumanRollout, PPOConfig
 from .bots import ScriptedHuman, ScriptedZombies
 from .envs import MatchTrainingEnv, league_groups
+from .league.gates import GateInputs, GateSpec, GateTracker, margins, passes
 from .league.pool import Entry, Pool, other
 from .league.slots import OpponentSlots
 from .metrics import MetricsLogger
@@ -82,6 +86,20 @@ class Seed:
 
 
 @dataclass
+class StageSpec:
+    """One curriculum stage (4.8.1): trained for at least `min_steps` and at most `max_steps`
+    env steps; with a `gate`, the league advances to the next stage when it passes and stops at
+    `max_steps` when it does not."""
+
+    name: str
+    env_config: str
+    zombie_counts: list[int]
+    min_steps: int = 0
+    max_steps: int = 100_000_000
+    gate: GateSpec | None = None
+
+
+@dataclass
 class LeagueConfig:
     run_id: str | None = None
     env_config: str = "configs/env/s0_small.yaml"
@@ -99,6 +117,18 @@ class LeagueConfig:
     eval_every: int = 20  # iterations; anchor evaluation against the scripted bots (0: off)
     eval_episodes: int = 64  # per zombie count
     checkpoint_every: int = 20
+    # Curriculum (M6.5): without `stages`, one stage from `stage`, `env_config`,
+    # `zombie_counts` and `total_steps`, without a gate.
+    stages: list[StageSpec] = field(default_factory=list)
+    gate_every: int = 20  # iterations between gate checks, after a stage's minimum budget
+    gate_episodes: int = 128  # per zombie count, for the anchors and the baselines
+    # Run both exploitability probes at a gate check once every other condition passes, unless
+    # the latest probe of the stage is younger than `probe_max_age_steps`.
+    probe_at_gates: bool = False
+    probe_max_age_steps: int = 50_000_000
+    probe_steps: int = 10_000_000
+    probe_every_steps: int = 0  # also every this many env steps (0: off)
+    forgetting_age_steps: int = 40_000_000
     league: LeagueParams = field(default_factory=LeagueParams)
     human: PPOConfig = field(default_factory=PPOConfig)
     zombie: MAPPOConfig = field(default_factory=MAPPOConfig)
@@ -128,7 +158,27 @@ class LeagueConfig:
         human = PPOConfig(**{**raw.pop("human", {}), "num_envs": rows_h})
         zombie = MAPPOConfig(**{**raw.pop("zombie", {}), "num_envs": rows_h})
         seeds = [Seed(**s) for s in raw.pop("seeds", [])]
-        return cls(**raw, league=LeagueParams(**lg), human=human, zombie=zombie, seeds=seeds)
+        stages = []
+        for st in raw.pop("stages", []):
+            gate = st.pop("gate", None)
+            if gate is not None:
+                if "balance" in gate:
+                    gate["balance"] = tuple(gate["balance"])
+                gate = GateSpec(**gate)
+            stages.append(StageSpec(**st, gate=gate))
+        return cls(
+            **raw,
+            league=LeagueParams(**lg),
+            human=human,
+            zombie=zombie,
+            seeds=seeds,
+            stages=stages,
+        )
+
+    def stage_list(self) -> list[StageSpec]:
+        if self.stages:
+            return self.stages
+        return [StageSpec(self.stage, self.env_config, self.zombie_counts, 0, self.total_steps)]
 
 
 def human_score(outcome: int) -> float:
@@ -198,10 +248,7 @@ class Guard:
 class League:
     def __init__(self, cfg: LeagueConfig, run_id: str, device: torch.device):
         self.cfg, self.run_id, self.device = cfg, run_id, device
-        self.env_cfg = load_config(resolve(cfg.env_config), env_overrides=False)
         p = cfg.league
-        self.groups = league_groups(cfg.num_envs, cfg.zombie_counts, p.shares)
-        self.env = MatchTrainingEnv(self.env_cfg, self.groups, cfg.seed, cfg.num_threads)
         self.human = HumanPPO(cfg.human, device)
         self.zombie = ZombieMAPPO(cfg.zombie, device)
         self.dir = Path(os.environ.get("ZAI_CHECKPOINT_DIR", "checkpoints")) / "league" / run_id
@@ -212,6 +259,92 @@ class League:
         self.guard = Guard(p)
         self.steps = self.iteration = 0
         self.last_snapshot = 0
+        self.last_probe = 0
+        self.stage_index = 0
+        self.stage_start = 0
+        self.starters: dict[str, str] = {}  # side -> pool entry the stage started from
+        self.baseline: dict[str, float] = {}
+        self.history: list[dict[str, Any]] = []  # finished stages
+        self.last_s_z = float("nan")
+        self.stopped: str | None = None
+        self.tracker: GateTracker | None = None
+        self._build_stage()
+
+    # --- stages -------------------------------------------------------------------------
+    @property
+    def stage(self) -> StageSpec:
+        return self.cfg.stage_list()[self.stage_index]
+
+    def _build_stage(self) -> None:
+        st = self.stage
+        self.env_cfg = load_config(resolve(st.env_config), env_overrides=False)
+        self.groups = league_groups(self.cfg.num_envs, st.zombie_counts, self.cfg.league.shares)
+        self.env = MatchTrainingEnv(
+            self.env_cfg, self.groups, self.cfg.seed + 7919 * self.stage_index, self.cfg.num_threads
+        )
+        self.tracker = GateTracker(st.gate) if st.gate is not None else None
+
+    def measure_baselines(self) -> None:
+        """Scripted human vs scripted zombies on this stage, on the gates' seeds."""
+        r = catch_rates(
+            self.env_cfg,
+            self.stage.zombie_counts,
+            lambda c, e, s: ScriptedHuman(c, e, seed=s),
+            lambda c, e, k, s: ScriptedZombies(c, e, k, seed=s),
+            self.cfg.gate_episodes,
+            777,
+            "x",
+        )
+        self.baseline = {
+            "survived": r["x/survived"],
+            "caught": r["x/caught"],
+            "caught_hi": r["x/caught_hi"],
+        }
+        log.info(
+            "stage %s baselines (scripted vs scripted): survived %.1f%%, caught %.1f%% [.., %.1f]",
+            self.stage.name,
+            100 * self.baseline["survived"],
+            100 * self.baseline["caught"],
+            100 * self.baseline["caught_hi"],
+        )
+
+    def advance(self) -> None:
+        """Next stage: the learners keep their weights and value normalization (fresh
+        optimizers), the pool restarts from the scripted bots and this stage's finals, the
+        score statistics and the guard reset, and the baselines are measured again."""
+        finished = self.stage.name
+        finals = {}
+        for side, algo in (("human", self.human), ("zombie", self.zombie)):
+            entry_id = f"{side}-{finished}-final"
+            path = self.dir / "pool" / side / f"{entry_id}.pt"
+            save_snapshot(path, algo.actor, side, self.steps, finished)
+            finals[side] = Entry(
+                entry_id, side, str(path), self.steps, finished, "stage_final", protected=True
+            )
+        self.history.append(
+            {"stage": finished, "start": self.stage_start, "end": self.steps, "result": "passed"}
+        )
+        p = self.cfg.league
+        self.pool = Pool(p.pool_cap, p.decay, p.pfsp, p.uniform)
+        for e in finals.values():
+            self.pool.add(e)
+        self.starters = {side: e.id for side, e in finals.items()}
+        self.guard = Guard(p)
+        self.human.optimizer = torch.optim.Adam(
+            list(self.human.actor.parameters()) + list(self.human.critic.parameters()),
+            lr=self.cfg.human.lr,
+            eps=1e-5,
+        )
+        self.zombie.optimizer = torch.optim.Adam(
+            list(self.zombie.actor.parameters()) + list(self.zombie.critic.parameters()),
+            lr=self.cfg.zombie.lr,
+            eps=1e-5,
+        )
+        self.stage_index += 1
+        self.stage_start = self.last_snapshot = self.last_probe = self.steps
+        self._build_stage()
+        self.measure_baselines()
+        log.info("advanced from %s to %s at %d steps", finished, self.stage.name, self.steps)
 
     # --- setup --------------------------------------------------------------------------
     def init_learners(self) -> None:
@@ -242,18 +375,30 @@ class League:
                     s.side,
                     str(resolve(s.path)),
                     int(sd.get("steps", 0)),
-                    self.cfg.stage,
+                    self.stage.name,
                     s.source,
                     protected=True,
                 )
             )
+        if not (self.cfg.human_init and self.cfg.zombie_init):
+            # Learners without a starter checkpoint enter the pool at their starting point.
+            self.snapshot()
+        for side in ("human", "zombie"):
+            starter = f"{side}-starter"
+            if any(e.id == starter for e in self.pool.entries[side]):
+                self.starters[side] = starter
+            else:
+                first = [e for e in self.pool.entries[side] if e.source == "league"]
+                if first:
+                    self.starters[side] = first[0].id
+        self.measure_baselines()
 
     def snapshot(self) -> None:
         for side, algo in (("human", self.human), ("zombie", self.zombie)):
             entry_id = self.pool.next_id(side)
             path = self.dir / "pool" / side / f"{entry_id}.pt"
-            save_snapshot(path, algo.actor, side, self.steps, self.cfg.stage)
-            self.pool.add(Entry(entry_id, side, str(path), self.steps, self.cfg.stage, "league"))
+            save_snapshot(path, algo.actor, side, self.steps, self.stage.name)
+            self.pool.add(Entry(entry_id, side, str(path), self.steps, self.stage.name, "league"))
         self.last_snapshot = self.steps
         log.info(
             "snapshot at %d steps: pool %d humans, %d zombies",
@@ -270,6 +415,7 @@ class League:
             "run_id": self.run_id,
             "env_config": self.env_cfg,
             "league": True,
+            "stage": self.stage.name,
         }
         root = Path(os.environ.get("ZAI_CHECKPOINT_DIR", "checkpoints"))
         for side, algo in (("human", self.human), ("zombie", self.zombie)):
@@ -281,8 +427,16 @@ class League:
             "iteration": self.iteration,
             "steps": self.steps,
             "last_snapshot": self.last_snapshot,
+            "last_probe": self.last_probe,
+            "stage_index": self.stage_index,
+            "stage_start": self.stage_start,
+            "starters": self.starters,
+            "baseline": self.baseline,
+            "history": self.history,
+            "streak": self.tracker.streak if self.tracker else 0,
+            "stopped": self.stopped,
             "pool": self.pool.state_dict(),
-            "guard": vars(self.guard) | {"p": None},
+            "guard": {k: v for k, v in vars(self.guard).items() if k != "p"},
             "rng": self.rng.bit_generator.state,
             "config": asdict(self.cfg),
         }
@@ -304,27 +458,53 @@ class League:
             algo.load_state_dict(sd)
         self.iteration, self.steps = state["iteration"], state["steps"]
         self.last_snapshot = state["last_snapshot"]
+        self.last_probe = state.get("last_probe", self.steps)
+        if state.get("stage_index", 0) != self.stage_index:
+            self.stage_index = state["stage_index"]
+            self._build_stage()
+        self.stage_start = state.get("stage_start", 0)
+        self.starters = state.get("starters", {})
+        self.baseline = state.get("baseline", {})
+        self.history = state.get("history", [])
+        if self.tracker is not None:
+            self.tracker.streak = state.get("streak", 0)
         self.pool = Pool.from_state_dict(state["pool"])
         for k, v in state["guard"].items():
-            if k != "p":
-                setattr(self.guard, k, v)
+            setattr(self.guard, k, v)
         self.rng.bit_generator.state = state["rng"]
+        if not self.baseline:
+            self.measure_baselines()
 
     def write_pool(self) -> None:
-        self.pool.write_summary(self.dir / "pool.json")
+        st = self.stage
+        extra = {
+            "stage": {
+                "name": st.name,
+                "index": self.stage_index,
+                "env_config": st.env_config,
+                "zombie_counts": st.zombie_counts,
+                "start_steps": self.stage_start,
+                "starters": self.starters,
+            },
+            "steps": self.steps,
+            "history": self.history,
+            "stopped": self.stopped,
+            "gate": self.tracker.last if self.tracker else {},
+        }
+        self.pool.write_summary(self.dir / "pool.json", extra)
         if self.public is not None:
-            self.pool.write_summary(self.public / "pool.json")
+            self.pool.write_summary(self.public / "pool.json", extra)
 
     # --- evaluation ---------------------------------------------------------------------
-    def anchors(self) -> dict[str, float]:
+    def anchors(self, episodes: int | None = None) -> dict[str, float]:
         """Latest learners against the scripted bots on fixed seeds (the gates' anchors)."""
-        dev, n = self.device, self.cfg.eval_episodes
+        dev, n = self.device, episodes or self.cfg.eval_episodes
         human = self.human.actor
         zomb = self.zombie.actor
         out = {}
         r = catch_rates(
             self.env_cfg,
-            self.cfg.zombie_counts,
+            self.stage.zombie_counts,
             lambda c, e, s: RecurrentHumanPolicy(human, e, dev),
             lambda c, e, k, s: ScriptedZombies(c, e, k, seed=s),
             n,
@@ -335,7 +515,7 @@ class League:
         out["anchor/human_caught"] = r["x/caught"]
         r = catch_rates(
             self.env_cfg,
-            self.cfg.zombie_counts,
+            self.stage.zombie_counts,
             lambda c, e, s: ScriptedHuman(c, e, seed=s),
             lambda c, e, k, s: RecurrentZombiePolicy(zomb, e, k, dev),
             n,
@@ -344,12 +524,106 @@ class League:
         )
         out["anchor/caught"] = r["x/caught"]
         out["anchor/caught_lo"], out["anchor/caught_hi"] = r["x/caught_lo"], r["x/caught_hi"]
+        for k in ("survived", "caught"):
+            if k in self.baseline:
+                out[f"anchor/baseline_{k}"] = self.baseline[k]
         return out
+
+    def run_probes(self) -> dict[str, float]:
+        """Exploitability probes of both sides at the current point (blocking, `arena.probe`)."""
+        self.save()
+        cmd = [
+            sys.executable,
+            "-m",
+            "arena.probe",
+            "--run-id",
+            self.run_id,
+            "--side",
+            "both",
+            "--steps",
+            str(self.cfg.probe_steps),
+            "--episodes",
+            str(self.cfg.gate_episodes),
+        ]
+        subprocess.run(cmd, check=True)
+        self.last_probe = self.steps
+        return self.read_probes()
+
+    def read_probes(self) -> dict[str, float]:
+        """Latest probe gap per side since this stage started."""
+        out: dict[str, float] = {}
+        path = self.dir / "probes.jsonl"
+        if path.is_file():
+            for line in path.read_text().splitlines():
+                r = json.loads(line)
+                if r["league_steps"] >= self.stage_start:
+                    out[r["side"]] = r["gap"]
+        return out
+
+    def read_elo(self) -> tuple[dict[str, tuple], dict[str, tuple]]:
+        """`(latest, starter)` Elo `(rating, lo, hi)` per side from this stage's arena report."""
+        try:
+            arena = json.loads((self.dir / "arena.json").read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}, {}
+        if arena.get("stage") != self.stage.name:
+            return {}, {}
+        by_id = {e["id"]: (e["elo"], e["elo_lo"], e["elo_hi"]) for e in arena["entries"]}
+        latest = {s: by_id[i] for s, i in arena["latest"].items() if i in by_id}
+        starter = {s: by_id[i] for s, i in self.starters.items() if i in by_id}
+        return latest, starter
+
+    def forgetting(self) -> dict[str, float]:
+        """Each learner's training score against this stage's snapshots older than 40 M steps."""
+        out = {}
+        for side in ("human", "zombie"):
+            old = [
+                e.id
+                for e in self.pool.entries[other(side)]
+                if e.source == "league"
+                and e.stage == self.stage.name
+                and e.steps <= self.steps - self.cfg.forgetting_age_steps
+            ]
+            out[side] = float(np.mean([self.pool.p(side, i) for i in old])) if old else float("nan")
+        return out
+
+    def check_gate(self) -> dict[str, float]:
+        """Evaluates the stage gate; returns the `gate/*` and anchor scalars. Probes run only
+        when every other condition passes (they take about 20 min per side)."""
+        assert self.tracker is not None
+        anchors = self.anchors(self.cfg.gate_episodes)
+        elo, elo_starter = self.read_elo()
+        x = GateInputs(
+            survived=anchors["anchor/survived"],
+            caught=anchors["anchor/caught"],
+            caught_lo=anchors["anchor/caught_lo"],
+            baseline_survived=self.baseline["survived"],
+            baseline_caught=self.baseline["caught"],
+            baseline_caught_hi=self.baseline["caught_hi"],
+            s_z=self.last_s_z,
+            forgetting=self.forgetting(),
+            elo=elo,
+            elo_starter=elo_starter,
+            probe_gap=self.read_probes(),
+        )
+        m = margins(self.tracker.spec, x)
+        others_pass = passes({k: v for k, v in m.items() if not k.startswith("probe_")})
+        stale = self.last_probe < self.stage_start or (
+            self.steps - self.last_probe >= self.cfg.probe_max_age_steps
+        )
+        if self.cfg.probe_at_gates and others_pass and stale:
+            x.probe_gap = self.run_probes()
+        self.tracker.update(x)
+        log.info(
+            "gate %s: streak %d, failing %s",
+            self.stage.name,
+            self.tracker.streak,
+            self.tracker.failing() or "none",
+        )
+        return anchors | self.tracker.scalars()
 
     # --- training -----------------------------------------------------------------------
     def run(self) -> None:
-        cfg, env, p = self.cfg, self.env, self.cfg.league
-        dev = self.device
         hlog = MetricsLogger(
             self.run_id,
             "human",
@@ -362,9 +636,38 @@ class League:
             os.environ.get("ZAI_SERVER_URL"),
             Path(os.environ.get("ZAI_RUNS_DIR", "runs")),
         )
-        if self.steps == 0 and not (cfg.human_init and cfg.zombie_init):
-            # Learners without a starter checkpoint enter the pool at their starting point.
-            self.snapshot()
+        started = time.time()
+        while self.stopped is None and self.steps < self.cfg.total_steps:
+            outcome = self.train_stage(hlog, zlog)
+            if outcome == "passed" and self.stage_index + 1 < len(self.cfg.stage_list()):
+                self.advance()
+                self.save()
+            elif outcome != "running":
+                self.stopped = outcome
+                self.history.append(
+                    {
+                        "stage": self.stage.name,
+                        "start": self.stage_start,
+                        "end": self.steps,
+                        "result": outcome,
+                    }
+                )
+                self.save()
+        hlog.close()
+        zlog.close()
+        log.info(
+            "done: %d steps in %.0f s (%s)",
+            self.steps,
+            time.time() - started,
+            self.stopped or "budget reached",
+        )
+
+    def train_stage(self, hlog: MetricsLogger, zlog: MetricsLogger) -> str:
+        """Trains on the current stage until its gate passes (`passed`), its maximum budget is
+        used up (`gate_failed` with a gate, `completed` without), or `total_steps` ends
+        (`running`)."""
+        cfg, env, p, st = self.cfg, self.env, self.cfg.league, self.stage
+        dev = self.device
         opp_z = OpponentSlots(
             "zombie",
             env,
@@ -406,17 +709,29 @@ class League:
         decision_s = self.env_cfg["dt_s"] * self.env_cfg["action_repeat"]
         window: deque = deque()  # group A (outcome, length_s, stats) of the guard window
         a_rows = env.kind == "A"
-        started = time.time()
         timer.take()
         log.info(
-            "league %s: %d envs (%s), %d human rows, %d zombie agents",
+            "league %s, stage %s: %d envs (%s), %d human rows, %d zombie agents",
             self.run_id,
+            st.name,
             env.num_envs,
             ", ".join(f"{g.kind}{g.zombie_count}x{g.num_envs}" for g in self.groups),
             eh,
             az,
         )
+        self.write_pool()
         while self.steps < cfg.total_steps:
+            in_stage = self.steps - self.stage_start
+            if in_stage >= st.max_steps:
+                if self.tracker is None:
+                    return "completed"
+                log.warning(
+                    "stage %s: gate not passed within %d steps; failing: %s",
+                    st.name,
+                    st.max_steps,
+                    self.tracker.failing(),
+                )
+                return "gate_failed"
             t0 = time.time()
             hstats, zstats = EpisodeStats(), EpisodeStats()
             hro.begin()
@@ -454,7 +769,8 @@ class League:
             t1 = time.time()
             hr = hro.finish(obs.state[env.human_rows])
             zr = zro.finish(obs.zombie_obs[env.zombie_agents], obs.state[env.zombie_envs])
-            progress = self.steps / cfg.total_steps
+            # Learning-rate schedules run over each stage's maximum budget.
+            progress = min(1.0, in_stage / st.max_steps)
             he, hs = self.guard.overrides("human", cfg.human.epochs)
             ze, zs = self.guard.overrides("zombie", cfg.zombie.epochs)
             hstat = self.human.update(hr, progress, he, hs)
@@ -476,6 +792,7 @@ class League:
             perf.update(timer.take())
             rollout_split(perf)
             hs_.update(perf)
+            hs_["league/stage"] = float(self.stage_index)
             zs_["train/nearest_zombie_m"] = zr["nearest_zombie_m"].item()
             for stats, out in ((hstats, hs_), (zstats, zs_)):
                 if stats.outcomes:
@@ -485,20 +802,7 @@ class League:
                     for code, name in OUTCOME_KEYS.items():
                         out[f"episode/{name}"] = float((o == code).mean())
             if self.iteration % p.guard_window == 0:
-                outcomes = np.array([w[0] for w in window])
-                s_z = self.guard.update(outcomes)
-                league = {
-                    "league/s_z": s_z,
-                    "league/guard": self.guard.state,
-                    "league/starvation_alarm": float(self.guard.alarm),
-                }
-                if len(outcomes):
-                    for code, name in OUTCOME_KEYS.items():
-                        league[f"episode_A/{name}"] = float((outcomes == code).mean())
-                    tm = tactic_metrics(
-                        np.stack([w[2] for w in window]), outcomes, np.array([w[1] for w in window])
-                    )
-                    league.update({f"tactics_train/{k}": v for k, v in tm.items()})
+                hs_.update(self._window_scalars(window))
                 window.clear()
                 for side, out in (("human", hs_), ("zombie", zs_)):
                     w = self.pool.weights(side)
@@ -509,26 +813,33 @@ class League:
                     ps = [self.pool.p(side, e) for e in w]
                     if ps:
                         out["pool/score_min"], out["pool/score_mean"] = min(ps), float(np.mean(ps))
-                hs_.update(league)
-                if self.guard.alarm:
-                    log.warning(
-                        "starvation alarm: group A ends in starvation > %.0f%%",
-                        100 * p.starvation_alarm,
-                    )
-            if cfg.eval_every and self.iteration % cfg.eval_every == 0:
-                t_eval = time.time()
-                ev = self.anchors()
-                hs_.update(ev)
-                hs_["perf/eval_s"] = time.time() - t_eval
             if self.steps - self.last_snapshot >= p.snapshot_every_steps:
                 self.snapshot()
+            passed = False
+            gate_due = (
+                self.tracker is not None
+                and self.steps - self.stage_start >= st.min_steps
+                and self.iteration % cfg.gate_every == 0
+            )
+            t_eval = time.time()
+            if gate_due:
+                hs_.update(self.check_gate())
+                passed = self.tracker.streak >= self.tracker.spec.consecutive
+            elif cfg.eval_every and self.iteration % cfg.eval_every == 0:
+                hs_.update(self.anchors())
+            if cfg.probe_every_steps and self.steps - self.last_probe >= cfg.probe_every_steps:
+                for side, gap in self.run_probes().items():
+                    hs_[f"probe/{side}_gap"] = gap
+            if time.time() - t_eval > 1e-3:
+                hs_["perf/eval_s"] = time.time() - t_eval
             hlog.log(self.steps, hs_)
             zlog.log(self.steps, zs_)
             log.info(
-                "it %d steps %d | human survived %.2f | zombies caught %.2f | s_z %s guard %d"
-                " | resident z %s h %s | %.0f steps/s",
+                "it %d steps %d | %s | human survived %.2f | zombies caught %.2f | s_z %s"
+                " guard %d | resident z %s h %s | %.0f steps/s",
                 self.iteration,
                 self.steps,
+                st.name,
                 hs_.get("episode/survived", float("nan")),
                 zs_.get("episode/caught", float("nan")),
                 f"{hs_['league/s_z']:.2f}" if "league/s_z" in hs_ else "-",
@@ -539,9 +850,35 @@ class League:
             )
             if self.iteration % cfg.checkpoint_every == 0 or self.steps >= cfg.total_steps:
                 self.save()
-        hlog.close()
-        zlog.close()
-        log.info("done: %d steps in %.0f s", self.steps, time.time() - started)
+            if passed:
+                log.info("stage %s: gate passed at %d steps", st.name, self.steps)
+                return "passed"
+        return "running"
+
+    def _window_scalars(self, window: deque) -> dict[str, float]:
+        """Guard update and group A outcome and tactic metrics of one window."""
+        p = self.cfg.league
+        outcomes = np.array([w[0] for w in window])
+        s_z = self.guard.update(outcomes)
+        if np.isfinite(s_z):
+            self.last_s_z = s_z
+        out = {
+            "league/s_z": s_z,
+            "league/guard": self.guard.state,
+            "league/starvation_alarm": float(self.guard.alarm),
+        }
+        if len(outcomes):
+            for code, name in OUTCOME_KEYS.items():
+                out[f"episode_A/{name}"] = float((outcomes == code).mean())
+            tm = tactic_metrics(
+                np.stack([w[2] for w in window]), outcomes, np.array([w[1] for w in window])
+            )
+            out.update({f"tactics_train/{k}": v for k, v in tm.items()})
+        if self.guard.alarm:
+            log.warning(
+                "starvation alarm: group A ends in starvation > %.0f%%", 100 * p.starvation_alarm
+            )
+        return out
 
 
 def main() -> None:
