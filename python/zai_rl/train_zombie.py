@@ -19,7 +19,6 @@ counters, unlike `--resume`).
 
 import argparse
 import logging
-import math
 import os
 import time
 from dataclasses import dataclass, field, fields
@@ -33,6 +32,7 @@ import yaml
 from arena.export_model import export_training_model
 from arena.export_replays import record_training_replays, training_replay_dir
 from arena.matches import MatchStats, play
+from arena.stats import wilson
 from zai_env.config import deep_merge, load_config
 
 from .algos.common import EpisodeStats, require_obs_version, save_checkpoint
@@ -114,16 +114,6 @@ def human_opponent(cfg: "ZombieTrainConfig", device: torch.device) -> HumanFacto
         assert cfg.human_checkpoint
         return frozen_human(resolve(cfg.human_checkpoint), device)
     return human_bot(cfg.opponent)
-
-
-def wilson(p: float, n: int, z: float = 1.96) -> tuple[float, float]:
-    """Wilson score interval of a proportion `p` observed over `n` trials."""
-    if n == 0:
-        return 0.0, 1.0
-    d = 1 + z * z / n
-    center = (p + z * z / (2 * n)) / d
-    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
-    return center - half, center + half
 
 
 def catch_rates(

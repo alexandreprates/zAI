@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod frames;
+pub mod leagues;
 pub mod matches;
 pub mod metrics;
 pub mod policy;
@@ -20,6 +21,7 @@ use tokio::sync::broadcast;
 use tower_http::services::{ServeDir, ServeFile};
 use zai_sim::Config;
 
+use crate::leagues::LeagueStore;
 use crate::matches::MatchHandle;
 use crate::metrics::MetricsStore;
 use crate::policy::ModelStore;
@@ -31,6 +33,8 @@ pub struct AppState {
     pub replays: ReplayStore,
     /// Trained models, in `models/` next to the replay directory.
     pub models: ModelStore,
+    /// League reports, in `leagues/` next to the replay directory.
+    pub leagues: LeagueStore,
     pub metrics: MetricsStore,
     pub metrics_tx: broadcast::Sender<String>,
     next_id: AtomicU64,
@@ -41,6 +45,7 @@ impl AppState {
     /// Models are read from the `models` directory next to `replays_dir`.
     pub fn new(base_config: Config, replays_dir: PathBuf, metrics_db: Option<PathBuf>) -> Self {
         let models = ModelStore::new(replays_dir.with_file_name("models"));
+        let leagues = LeagueStore::new(replays_dir.with_file_name("leagues"));
         let replays = ReplayStore::new(replays_dir).expect("replay directory is writable");
         let metrics = MetricsStore::open(metrics_db.as_deref()).expect("metrics database opens");
         let (metrics_tx, _) = broadcast::channel(1024);
@@ -49,6 +54,7 @@ impl AppState {
             matches: RwLock::new(HashMap::new()),
             replays,
             models,
+            leagues,
             metrics,
             metrics_tx,
             next_id: AtomicU64::new(1),
@@ -123,6 +129,8 @@ pub fn app(state: Arc<AppState>, web_dir: Option<PathBuf>) -> Router {
         )
         .route("/api/metrics/stream", get(api::metrics_stream))
         .route("/api/runs", get(api::list_runs))
+        .route("/api/leagues", get(api::list_leagues))
+        .route("/api/leagues/{id}", get(api::get_league))
         .route("/ws/match/{id}", get(ws::live))
         .route("/ws/replay/{id}", get(ws::replay))
         .with_state(state);

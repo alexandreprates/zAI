@@ -2,6 +2,7 @@ import { decode } from "@msgpack/msgpack";
 
 import type {
   Frame,
+  LeagueReport,
   MatchInfo,
   MetricPoint,
   ModelInfo,
@@ -21,6 +22,11 @@ export const listMatches = () => fetch("/api/matches").then((r) => json<MatchInf
 export const listReplays = () => fetch("/api/replays").then((r) => json<ReplaySummary[]>(r));
 export const listModels = () => fetch("/api/models").then((r) => json<ModelInfo[]>(r));
 export const listRuns = () => fetch("/api/runs").then((r) => json<RunSummary[]>(r));
+/** League report of a run, or `null` when the run is not a league. */
+export const getLeague = (runId: string) =>
+  fetch(`/api/leagues/${encodeURIComponent(runId)}`).then((r) =>
+    r.status === 404 ? null : json<LeagueReport>(r),
+  );
 export const listMetrics = (runId: string) =>
   fetch(`/api/metrics?run_id=${encodeURIComponent(runId)}`).then((r) => json<MetricPoint[]>(r));
 

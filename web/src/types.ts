@@ -105,3 +105,67 @@ export interface RunSummary {
   last_step: number;
   updated: number;
 }
+
+/** League reports (`GET /api/leagues/{id}`, written by `zai_rl.train_league` and `arena.league`). */
+export interface LeagueSummary {
+  id: string;
+  updated: number;
+}
+
+export interface PoolEntry {
+  id: string;
+  side: "human" | "zombie";
+  path: string | null;
+  steps: number;
+  stage: string;
+  source: string;
+  protected: boolean;
+  created: number;
+  /** The other side's learner's decayed score against this entry. */
+  p_learner: number;
+  games: number;
+  /** PFSP sampling weight among the side's non-scripted entries. */
+  weight: number;
+}
+
+export interface PoolReport {
+  updated: number;
+  pfsp: string;
+  sides: { human: PoolEntry[]; zombie: PoolEntry[] };
+}
+
+export interface ArenaEntry {
+  id: string;
+  side: "human" | "zombie";
+  source: string;
+  steps: number;
+  elo: number;
+  elo_lo: number;
+  elo_hi: number;
+}
+
+export interface CrossplayRow {
+  human: string;
+  zombie: string;
+  episodes: number;
+  /** Mean human score: survived 1, starved 0.5, caught 0. */
+  score: number;
+  caught: number;
+  starved: number;
+  survived: number;
+}
+
+export interface ArenaReport {
+  run_id: string;
+  updated: number;
+  anchor: string;
+  entries: ArenaEntry[];
+  crossplay: CrossplayRow[];
+  latest: { human: string | null; zombie: string | null };
+}
+
+export interface LeagueReport {
+  id: string;
+  pool: PoolReport | null;
+  arena: ArenaReport | null;
+}

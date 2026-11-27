@@ -5,7 +5,22 @@ import { listMetrics } from "./api";
 
 const COLORS = ["#4ea8ff", "#f5c451", "#3ecf8e", "#e5484d", "#b58cff", "#ff8f5c", "#5ce1e6", "#9aa5b1"];
 /** Chart groups shown first; anything else follows alphabetically. */
-const ORDER = ["/eval/", "/eval_vs_learned_human/", "/episode/", "/train/", "/perf/"];
+const ORDER = [
+  "/gate/",
+  "/anchor/",
+  "/elo/",
+  "/xplay/",
+  "/eval/",
+  "/eval_vs_learned_human/",
+  "/episode_A/",
+  "/episode/",
+  "/league/",
+  "/pool/",
+  "/tactics/",
+  "/tactics_train/",
+  "/train/",
+  "/perf/",
+];
 const AXIS = { stroke: "#8b93a1", grid: { stroke: "#2e3440", width: 1 }, ticks: { stroke: "#2e3440" } };
 
 interface Series {

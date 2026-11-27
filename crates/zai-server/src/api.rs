@@ -135,6 +135,25 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+/// League runs with a pool or arena report (`leagues.rs`), newest first.
+pub async fn list_leagues(State(state): State<Arc<AppState>>) -> Response {
+    let store = state.leagues.clone();
+    match tokio::task::spawn_blocking(move || store.list()).await {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// `{"id", "pool", "arena"}` of one league run.
+pub async fn get_league(Path(id): Path<String>, State(state): State<Arc<AppState>>) -> Response {
+    let store = state.leagues.clone();
+    match tokio::task::spawn_blocking(move || store.get(&id)).await {
+        Ok(Some(v)) => Json(v).into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, "league not found"),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 pub async fn list_replays(State(state): State<Arc<AppState>>) -> Response {
     let store = state.replays.clone();
     match tokio::task::spawn_blocking(move || store.list()).await {

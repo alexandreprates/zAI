@@ -10,6 +10,7 @@ import {
   Stream,
 } from "./api";
 import { Charts } from "./charts";
+import { LeaguePanel } from "./league";
 import type { Scene3D } from "./scene3d";
 import { TopDown } from "./topdown";
 import type { Agent, Frame, InitFrame, ModelInfo, ReplaySummary, SnapshotFrame } from "./types";
@@ -24,6 +25,7 @@ type ViewMode = "2d" | "3d";
 let viewMode: ViewMode = localStorage.getItem("zai.view") === "3d" ? "3d" : "2d";
 let follow = localStorage.getItem("zai.follow") !== "off";
 let charts: Charts;
+let league: LeaguePanel;
 let stream: Stream | null = null;
 let init: InitFrame | null = null;
 let last: SnapshotFrame | null = null;
@@ -162,12 +164,14 @@ function showRun(runId: string): void {
   showStage(false);
   $("status").textContent = `Training run ${runId}`;
   void charts.show(runId).catch((e) => ($("status").textContent = (e as Error).message));
+  void league.show(runId);
   void refreshLists();
 }
 
 function watch(path: string, key: string, run: string | null = null): void {
   stream?.close();
   charts.hide();
+  league.hide();
   currentRun = run;
   showStage(true);
   selected = key;
@@ -434,6 +438,7 @@ async function main(): Promise<void> {
   await view.mount($("view-2d"));
   await setView(viewMode);
   charts = new Charts($("charts"));
+  league = new LeaguePanel($("league"));
   setupControls();
   await refreshLists();
   setInterval(refreshLists, 3000);
