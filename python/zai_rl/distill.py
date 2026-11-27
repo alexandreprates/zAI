@@ -3,9 +3,11 @@
 
 The teacher is any checkpoint of either side, usually one trained on layout v1, which sees its
 own inputs through `zai_env.legacy`. The student has the teacher's architecture on the current
-layout and is trained with on-policy DAgger: each env's episode is driven by the teacher with
-probability `beta` (1 -> 0 over the first `beta_fraction` of the steps), otherwise by the
-student, and the student always runs on the visited states. Losses, over BPTT chunks:
+layout, starts from the teacher's weights rewritten for the v2 inputs (`zai_rl.transplant`,
+exact within 100 m; `warm_start`), and is trained with on-policy DAgger: each env's episode is
+driven by the teacher with probability `beta` (1 -> 0 over the first `beta_fraction` of the
+steps), otherwise by the student, and the student always runs on the visited states. Losses,
+over BPTT chunks:
 
 - actor: `KL(teacher || student)` of the masked action distributions (both human heads);
 - critic: squared error to the teacher's normalized value; `value_rms` is the teacher's, so the
@@ -54,6 +56,7 @@ from .policy import (
 )
 from .train import OUTCOME_KEYS, resolve
 from .train_zombie import catch_rates
+from .transplant import transplant_actor, transplant_critic
 
 log = logging.getLogger("zai_rl.distill")
 
@@ -76,6 +79,9 @@ class DistillConfig:
     max_grad_norm: float = 0.5
     vf_coef: float = 0.5
     beta_fraction: float = 0.3
+    # Start a v1 teacher's student from the teacher's weights composed with the v2 -> v1
+    # input map (zai_rl.transplant), exact within 100 m.
+    warm_start: bool = True
     seed: int = 0
     num_threads: int | None = None
     torch_threads: int | None = None
@@ -182,6 +188,9 @@ class Distiller:
         self.device = device
         self.teacher = Teacher(resolve(cfg.teacher), cfg.side, device)
         self.algo = student_for(cfg, self.teacher, device)
+        if cfg.warm_start and self.teacher.legacy:
+            transplant_actor(self.algo.actor, self.teacher.actor, env_cfg)
+            transplant_critic(self.algo.critic, self.teacher.critic, env_cfg)
         self.opponents = opponents(cfg, device)
         counts = cfg.zombie_counts * len(self.opponents)
         factories = [f for _, f in self.opponents for _ in cfg.zombie_counts]

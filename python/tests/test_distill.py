@@ -43,8 +43,9 @@ def tiny(tmp_path):
     )
 
 
+@pytest.mark.parametrize("warm", [False, True])
 @pytest.mark.parametrize("side", ["human", "zombie"])
-def test_updates_bring_the_student_closer_to_the_teacher(tiny, side):
+def test_updates_bring_the_student_closer_to_the_teacher(tiny, side, warm):
     env_path, h, z = tiny
     cfg = distill.DistillConfig(
         side=side,
@@ -60,6 +61,7 @@ def test_updates_bring_the_student_closer_to_the_teacher(tiny, side):
         lr=3e-3,
         num_threads=1,
         device="cpu",
+        warm_start=warm,
     )
     env_cfg = load_config(env_path, env_overrides=False)
     d = distill.Distiller(cfg, env_cfg, torch.device("cpu"))
@@ -72,6 +74,10 @@ def test_updates_bring_the_student_closer_to_the_teacher(tiny, side):
     ep = {"outcome": [], "teacher": [], "length": []}
     rollout, *_ = d.collect(batch, h_s, h_t, start, beta=0.5, ep=ep)
     first = d.update(rollout)["train/kl"]
+    if warm:
+        # The transplanted student already matches the teacher on this 75 m map.
+        assert first < 1e-4
+        return
     for _ in range(15):
         last = d.update(rollout)["train/kl"]
     assert last < 0.5 * first
