@@ -1,0 +1,34 @@
+# M6.0 throughput profiling (docs/ARCHITECTURE.md section 4.8.3): zombie_s0small_gpu.yaml
+# cut to 12 iterations, with CUDA-synchronized phase timers and a torch.profiler trace of
+# iteration 8.
+env_config: configs/env/s0_small.yaml
+zombie_counts: [2, 3, 4]
+opponent: scripted
+total_steps: 1572864
+seed: 0
+num_threads: 20
+torch_threads: 4
+device: cuda
+profile_sync: true
+profile_iteration: 8
+eval_every: 6
+eval_episodes: 128
+baseline_episodes: 64
+checkpoint_every: 1000
+replay_every: 0
+replay_episodes: 2
+mappo:
+  num_envs: 1024
+  rollout: 128
+  bptt: 64
+  epochs: 3
+  minibatches: 8
+  lr: 0.0003
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip: 0.2
+  ent_start: 0.01
+  ent_end: 0.001
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  hidden: 128

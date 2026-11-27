@@ -35,6 +35,8 @@ services:
       ZAI_CHECKPOINT_DIR: /checkpoints
       ZAI_RUNS_DIR: /runs
       ZAI_DATA_DIR: /data
+      # Less fragmentation with the variable-size GRU batches of the updates (M6.0 profiling).
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     volumes:
       - checkpoints:/checkpoints
       - runs:/runs

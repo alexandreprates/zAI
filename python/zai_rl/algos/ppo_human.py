@@ -17,6 +17,7 @@ from torch import nn
 
 from ..envs import HumanBatch, HumanTrainingEnv
 from ..models import HumanActor, HumanCritic
+from ..profiling import timer
 from .common import EpisodeStats, RunningMeanStd, bptt_sequences, gae, save_checkpoint
 
 __all__ = [
@@ -98,27 +99,30 @@ class HumanPPO:
         }
         h0 = []
         for t in range(T):
-            obs = self._t(batch.obs)
-            mask = self._t(batch.mask, torch.bool)
-            state = self._t(batch.state)
-            h = h * (~start).unsqueeze(1)
-            if t % L == 0:
-                h0.append(h.clone())
-            move, interact, h_new = self.actor.step(obs, h, mask)
-            a_move, a_inter = move.sample(), interact.sample()
-            logp = move.log_prob(a_move) + interact.log_prob(a_inter)
-            value = self.value(state)
-            actions = torch.stack([a_move, a_inter], dim=1)
+            with timer("policy"):
+                obs = self._t(batch.obs)
+                mask = self._t(batch.mask, torch.bool)
+                state = self._t(batch.state)
+                h = h * (~start).unsqueeze(1)
+                if t % L == 0:
+                    h0.append(h.clone())
+                move, interact, h_new = self.actor.step(obs, h, mask)
+                a_move, a_inter = move.sample(), interact.sample()
+                logp = move.log_prob(a_move) + interact.log_prob(a_inter)
+                value = self.value(state)
+                actions = torch.stack([a_move, a_inter], dim=1)
+                actions_np = actions.cpu().numpy()
 
-            step = env.step(actions.cpu().numpy())
+            step = env.step(actions_np)
             reward = step.reward.astype(np.float32)
             ep_return += reward
             done = step.terminated | step.truncated
             reward_t = self._t(reward)
             if step.truncated.any():
-                idx = np.nonzero(step.truncated)[0]
-                v_final = self.value(self._t(step.final_state[idx]))
-                reward_t[idx] += cfg.gamma * v_final
+                with timer("policy"):
+                    idx = np.nonzero(step.truncated)[0]
+                    v_final = self.value(self._t(step.final_state[idx]))
+                    reward_t[idx] += cfg.gamma * v_final
 
             for k, v in (
                 ("obs", obs),

@@ -17,6 +17,8 @@ import numpy as np
 from zai_env.config import deep_merge
 from zai_env.vec import ZaiVecEnv
 
+from .profiling import timer
+
 ZombieFactory = Callable[[dict[str, Any], int, int, int], Any]
 HumanFactory = Callable[[dict[str, Any], int, int], Any]
 
@@ -87,10 +89,14 @@ class HumanTrainingEnv:
         start = 0
         for (venv, zombies), zobs in zip(self.groups, self._zombie_obs, strict=True):
             end = start + venv.num_envs
-            step = venv.step(human_actions[start:end], zombies.act(zobs))
+            with timer("opponent"):
+                zombie_actions = zombies.act(zobs)
+            with timer("sim"):
+                step = venv.step(human_actions[start:end], zombie_actions)
             # Recurrent opponents (trained zombie policies) clear the memory of finished envs.
             if hasattr(zombies, "reset"):
-                zombies.reset(step.terminated | step.truncated)
+                with timer("opponent"):
+                    zombies.reset(step.terminated | step.truncated)
             parts.append(step)
             start = end
         self._zombie_obs = [p.obs.zombie_obs for p in parts]
@@ -173,9 +179,13 @@ class ZombieTrainingEnv:
         for (venv, human, n), (hobs, hmask) in zip(self.groups, self._human, strict=True):
             end = start + venv.num_envs * n
             za = zombie_actions[start:end].reshape(venv.num_envs, n)
-            step = venv.step(human.act(hobs, hmask), za)
+            with timer("opponent"):
+                human_actions = human.act(hobs, hmask)
+            with timer("sim"):
+                step = venv.step(human_actions, za)
             if hasattr(human, "reset"):
-                human.reset(step.terminated | step.truncated)
+                with timer("opponent"):
+                    human.reset(step.terminated | step.truncated)
             parts.append(step)
             start = end
         self._human = [(p.obs.human_obs.copy(), p.obs.human_mask.copy()) for p in parts]

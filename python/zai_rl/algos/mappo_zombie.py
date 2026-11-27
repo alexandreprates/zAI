@@ -21,6 +21,7 @@ from zai_env.layout import STATE
 
 from ..envs import ZombieBatch, ZombieTrainingEnv
 from ..models import ZombieActor, ZombieCritic
+from ..profiling import timer
 from .common import EpisodeStats, RunningMeanStd, bptt_sequences, gae
 
 
@@ -106,28 +107,32 @@ class ZombieMAPPO:
         nearest = []
         for t in range(T):
             nearest.append(nearest_zombie_m(batch.state, env.map_size_m).mean())
-            obs = self._t(batch.obs)
-            state = self._t(batch.state)
-            h = h * (~start).unsqueeze(1)
-            if t % L == 0:
-                h0.append(h.clone())
-            dist, h_new = self.actor.step(obs, h)
-            actions = dist.sample()
-            logp = dist.log_prob(actions)
-            value = self.value(state[agent_env], obs)
+            with timer("policy"):
+                obs = self._t(batch.obs)
+                state = self._t(batch.state)
+                h = h * (~start).unsqueeze(1)
+                if t % L == 0:
+                    h0.append(h.clone())
+                dist, h_new = self.actor.step(obs, h)
+                actions = dist.sample()
+                logp = dist.log_prob(actions)
+                value = self.value(state[agent_env], obs)
+                actions_np = actions.cpu().numpy()
 
-            step = env.step(actions.cpu().numpy())
+            step = env.step(actions_np)
             reward = step.reward.astype(np.float32)
             ep_return += reward
             env_done = step.terminated | step.truncated
             done = env_done[env.agent_env]
             reward_t = self._t(reward)
             if step.truncated.any():
-                idx = np.nonzero(step.truncated[env.agent_env])[0]
-                v_final = self.value(
-                    self._t(step.final_state[env.agent_env[idx]]), self._t(step.final_obs[idx])
-                )
-                reward_t[idx] += cfg.gamma * v_final
+                with timer("policy"):
+                    idx = np.nonzero(step.truncated[env.agent_env])[0]
+                    v_final = self.value(
+                        self._t(step.final_state[env.agent_env[idx]]),
+                        self._t(step.final_obs[idx]),
+                    )
+                    reward_t[idx] += cfg.gamma * v_final
 
             for k, v in (
                 ("obs", obs),
@@ -211,8 +216,9 @@ class ZombieMAPPO:
                 ratio = log_ratio.exp()
                 pg = -torch.min(ratio * adv, ratio.clamp(1 - cfg.clip, 1 + cfg.clip) * adv).mean()
 
-                rows = seq_t0[idx].unsqueeze(1) + offsets  # [mb, L]
-                mb_state = state[rows, seq_env[idx].unsqueeze(1)]  # [mb, L, S]
+                with timer("update_gather"):
+                    rows = seq_t0[idx].unsqueeze(1) + offsets  # [mb, L]
+                    mb_state = state[rows, seq_env[idx].unsqueeze(1)]  # [mb, L, S]
                 v_pred = self.critic(
                     mb_state.reshape(-1, state.shape[-1]),
                     data["obs"][idx].reshape(-1, data["obs"].shape[-1]),

@@ -33,6 +33,7 @@ from .bots import ScriptedHuman, ScriptedZombies
 from .envs import HumanTrainingEnv
 from .metrics import MetricsLogger
 from .policy import RecurrentHumanPolicy, RecurrentZombiePolicy
+from .profiling import maybe_trace, rollout_split, timer
 
 log = logging.getLogger("zai_rl.train")
 REPO = Path(__file__).resolve().parents[2]
@@ -61,6 +62,11 @@ class TrainConfig:
     # episodes of the current policy into the server replays (needs ZAI_DATA_DIR).
     replay_every: int = 0
     replay_episodes: int = 2
+    # Profiling (M6.0): synchronize CUDA at phase ends for exact perf/* splits, and take one
+    # torch.profiler trace of iteration `profile_iteration` (1-based, 0 = off) into
+    # <ZAI_RUNS_DIR>/<run_id>/profile_<side>/.
+    profile_sync: bool = False
+    profile_iteration: int = 0
     ppo: PPOConfig = field(default_factory=PPOConfig)
 
     @classmethod
@@ -143,6 +149,7 @@ def main() -> None:
     )
     if cfg.torch_threads:
         torch.set_num_threads(cfg.torch_threads)
+    timer.configure(cfg.profile_sync)
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 
@@ -215,13 +222,17 @@ def main() -> None:
     ep_return = np.zeros(env.num_envs, dtype=np.float64)
     per_iter = cfg.ppo.rollout * env.num_envs
     started = time.time()
+    profile_dir = Path(os.environ.get("ZAI_RUNS_DIR", "runs")) / run_id / "profile_human"
+    checkpoint_s = 0.0  # time of the previous iteration's checkpoint, logged with this one
+    timer.take()
     while steps < cfg.total_steps:
-        t0 = time.time()
-        ep = EpisodeStats()
-        rollout, batch, h, start = algo.collect(env, batch, h, start, ep_return, ep)
-        t1 = time.time()
-        stats = algo.update(rollout, steps / cfg.total_steps)
-        t2 = time.time()
+        with maybe_trace(iteration + 1, cfg.profile_iteration, profile_dir):
+            t0 = time.time()
+            ep = EpisodeStats()
+            rollout, batch, h, start = algo.collect(env, batch, h, start, ep_return, ep)
+            t1 = time.time()
+            stats = algo.update(rollout, steps / cfg.total_steps)
+            t2 = time.time()
         iteration += 1
         steps += per_iter
 
@@ -229,6 +240,8 @@ def main() -> None:
         scalars["perf/steps_per_s"] = per_iter / (t2 - t0)
         scalars["perf/rollout_s"] = t1 - t0
         scalars["perf/update_s"] = t2 - t1
+        scalars.update(timer.take())
+        rollout_split(scalars)
         scalars["train/reward_mean"] = rollout["rewards"].mean().item()
         if ep.returns:
             outcomes = np.array(ep.outcomes)
@@ -239,6 +252,7 @@ def main() -> None:
                 scalars[f"episode/{name}"] = float((outcomes == code).mean())
 
         if iteration % cfg.eval_every == 0:
+            t_eval = time.time()
             ev = evaluate(env_cfg, algo, cfg.eval_episodes, cfg.seed + 777, opponent)
             if cfg.opponent != "scripted":
                 # Watch for forgetting how to beat the bots it was trained against first.
@@ -256,6 +270,7 @@ def main() -> None:
                 100 * ev["eval/caught"],
                 100 * ev["eval/starved"],
             )
+            scalars["perf/eval_s"] = time.time() - t_eval
 
         if (
             replay_dir
@@ -263,6 +278,7 @@ def main() -> None:
             and (iteration == 1 or iteration % cfg.replay_every == 0)
         ):
             n = show_cfg["zombie_count"]
+            t_replay = time.time()
             recorded = record_training_replays(
                 replay_dir,
                 run_id,
@@ -276,7 +292,12 @@ def main() -> None:
                 cfg.replay_episodes,
             )
             log.info("replays: %s", ", ".join(f"{r['id']} {r['outcome']}" for r in recorded))
+            scalars["perf/replay_s"] = time.time() - t_replay
 
+        scalars["perf/checkpoint_s"] = checkpoint_s
+        wall = time.time() - t0 + checkpoint_s
+        scalars["perf/wall_s"] = wall
+        scalars["perf/wall_steps_per_s"] = per_iter / wall
         metrics.log(steps, scalars)
         log.info(
             "it %d steps %d | return %.3f len %.0fs survived %.2f | %.0f steps/s",
@@ -287,6 +308,7 @@ def main() -> None:
             scalars.get("episode/survived", float("nan")),
             scalars["perf/steps_per_s"],
         )
+        t_ckpt = time.time()
         if iteration % cfg.checkpoint_every == 0 or steps >= cfg.total_steps:
             extra = {
                 "iteration": iteration,
@@ -298,6 +320,7 @@ def main() -> None:
             save_checkpoint(ckpt_dir / "latest.pt", algo, extra)
             # Live matches in the viewer play the latest exported model of each run.
             export_training_model(algo.actor, run_id, show_cfg, iteration, steps)
+        checkpoint_s = time.time() - t_ckpt
 
     metrics.close()
     log.info("done: %d steps in %.0f s", steps, time.time() - started)
