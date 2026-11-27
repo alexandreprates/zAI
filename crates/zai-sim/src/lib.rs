@@ -9,6 +9,7 @@ pub mod env;
 pub mod geom;
 pub mod map;
 pub mod obs;
+pub mod stats;
 
 #[cfg(test)]
 mod tests;
@@ -16,6 +17,7 @@ mod tests;
 pub use config::{Config, ConfigError, ZombieShapingMode};
 pub use env::{Env, HumanAction, NoiseKind, Outcome, StepResult};
 pub use obs::{HUMAN_OBS_DIM, OBS_VERSION, STATE_DIM, ZOMBIE_OBS_DIM};
+pub use stats::{EpisodeStats, STATS_DIM, STATS_LAYOUT};
 
 /// Version of the simulation crate, exposed to the bindings and the server.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

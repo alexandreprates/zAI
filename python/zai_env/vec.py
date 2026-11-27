@@ -36,6 +36,7 @@ class VecStep:
     final_human_obs: np.ndarray  # rows valid where terminated | truncated
     final_zombie_obs: np.ndarray
     final_state: np.ndarray
+    final_stats: np.ndarray  # float32 [E, STATS_DIM]: tactic counters (zai_env.layout.STATS)
 
 
 class ZaiVecEnv:

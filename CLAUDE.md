@@ -48,6 +48,7 @@ The user's shell exports `DOCKER_DEFAULT_PLATFORM=linux/amd64`; the `Makefile` u
 - Never hardcode observation indices in Python: use `zai_env.layout` (`HUMAN`, `ZOMBIE`, `STATE`, `house_deltas_m`), built from the layout tables in `crates/zai-sim/src/obs.rs`.
 - Checkpoints store `obs_version` (missing means v1). v1 actors (`HumanActor(obs_version=1)`) play as frozen policies through `zai_env.legacy.adapt_v1_*` (pass `config=` to `Recurrent*Policy.from_checkpoint`); training, resume, `init_checkpoint` and ONNX export refuse them. `tests/test_legacy.py` replays `tests/fixtures/obs_v1.npz` (recorded from the v1 encoders) to check the adapter, the dynamics and the bots.
 - `zai_rl.bots` holds the vectorized scripted/random policies; `arena.matches.play` runs batched bot-vs-bot matches (first episode per env only).
+- Tactic counters (M6.2): `Env` accumulates per-episode `EpisodeStats` (`crates/zai-sim/src/stats.rs`, names in `STATS_LAYOUT` / `zai_env.layout.STATS`); `VecStep.final_stats` holds them for finished episodes, `arena.matches.play_detailed` returns them per episode, and `arena.tactics.tactic_metrics` turns them into `human/*` and `zombie/*` metrics.
 - `make test` builds the extension with `maturin develop --release`; Python tests include a VecEnv-vs-Env parity test and the PettingZoo API tests.
 
 ## Server and viewer (`crates/zai-server`, `web/`)

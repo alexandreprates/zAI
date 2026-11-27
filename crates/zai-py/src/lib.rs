@@ -13,7 +13,8 @@ use ::zai_sim::obs::{
     ZOMBIE_LAYOUT,
 };
 use ::zai_sim::{
-    Config, Env as SimEnv, HumanAction, Outcome, HUMAN_OBS_DIM, STATE_DIM, ZOMBIE_OBS_DIM,
+    Config, Env as SimEnv, HumanAction, Outcome, HUMAN_OBS_DIM, STATE_DIM, STATS_DIM,
+    ZOMBIE_OBS_DIM,
 };
 use numpy::{Element, PyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
@@ -211,6 +212,13 @@ impl Env {
         PyArray1::from_vec(py, v)
     }
 
+    /// Tactic counters of the current episode, in the order of `STATS_LAYOUT`.
+    fn episode_stats<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
+        let mut v = vec![0.0; STATS_DIM];
+        self.inner.episode_stats().write(&mut v);
+        PyArray1::from_vec(py, v)
+    }
+
     fn state_hash(&self) -> u64 {
         self.inner.state_hash()
     }
@@ -291,6 +299,7 @@ struct Buffers {
     final_human_obs: Py<PyArray2<f32>>,
     final_zombie_obs: Py<PyArray3<f32>>,
     final_state: Py<PyArray2<f32>>,
+    final_stats: Py<PyArray2<f32>>,
 }
 
 #[derive(Clone, Copy)]
@@ -308,6 +317,7 @@ struct Raw {
     final_human_obs: RawBuf<f32>,
     final_zombie_obs: RawBuf<f32>,
     final_state: RawBuf<f32>,
+    final_stats: RawBuf<f32>,
 }
 
 impl Buffers {
@@ -330,6 +340,7 @@ impl Buffers {
             final_human_obs: PyArray2::zeros(py, [e, HUMAN_OBS_DIM], false).unbind(),
             final_zombie_obs: PyArray3::zeros(py, [e, n, ZOMBIE_OBS_DIM], false).unbind(),
             final_state: PyArray2::zeros(py, [e, STATE_DIM], false).unbind(),
+            final_stats: PyArray2::zeros(py, [e, STATS_DIM], false).unbind(),
         }
     }
 
@@ -348,6 +359,7 @@ impl Buffers {
             final_human_obs: RawBuf::of(self.final_human_obs.bind(py)),
             final_zombie_obs: RawBuf::of(self.final_zombie_obs.bind(py)),
             final_state: RawBuf::of(self.final_state.bind(py)),
+            final_stats: RawBuf::of(self.final_stats.bind(py)),
         }
     }
 
@@ -543,6 +555,7 @@ impl VecEnv {
                                     raw.final_zombie_obs,
                                     raw.final_state,
                                 );
+                                env.episode_stats().write(raw.final_stats.row(i, STATS_DIM));
                                 *ep += 1;
                                 env.reset(episode_seed(base, i as u64, *ep));
                             }
@@ -560,6 +573,7 @@ impl VecEnv {
         info.set_item("final_human_obs", b.final_human_obs.bind(py))?;
         info.set_item("final_zombie_obs", b.final_zombie_obs.bind(py))?;
         info.set_item("final_state", b.final_state.bind(py))?;
+        info.set_item("final_stats", b.final_stats.bind(py))?;
         Ok((
             b.obs_dict(py)?,
             b.human_reward.bind(py).clone(),
@@ -608,6 +622,7 @@ impl VecEnv {
 fn zai_sim(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", ::zai_sim::VERSION)?;
     m.add("OBS_VERSION", ::zai_sim::OBS_VERSION)?;
+    m.add("STATS_LAYOUT", ::zai_sim::STATS_LAYOUT.to_vec())?;
     m.add("OBS_NEAR_M", ::zai_sim::obs::NEAR_M)?;
     m.add("OBS_FAR_M", ::zai_sim::obs::FAR_M)?;
     m.add("OBS_TIME_SCALE_S", ::zai_sim::obs::TIME_SCALE_S)?;

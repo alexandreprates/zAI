@@ -9,6 +9,7 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::config::{Config, ConfigError, ZombieShapingMode};
 use crate::map::Map;
+use crate::stats::{self, EpisodeStats};
 
 /// Movement action meaning "do not move". Actions `0..16` move in direction `i * 22.5` degrees.
 pub const STAY: u8 = 16;
@@ -148,6 +149,8 @@ pub struct Env {
     pub(crate) events: Vec<NoiseEvent>,
     /// Per-zombie reward of the last step (team reward plus distance shaping).
     pub(crate) zombie_rewards: Vec<f32>,
+    /// Tactic counters of the current episode.
+    pub(crate) stats: EpisodeStats,
 }
 
 impl Env {
@@ -178,6 +181,7 @@ impl Env {
             outcome: Outcome::Running,
             events: Vec::new(),
             zombie_rewards: Vec::new(),
+            stats: EpisodeStats::default(),
         };
         env.reset(seed);
         Ok(env)
@@ -258,6 +262,7 @@ impl Env {
         self.events.clear();
         self.zombie_rewards.clear();
         self.zombie_rewards.resize(self.zombies.len(), 0.0);
+        self.stats = EpisodeStats::default();
         self.update_perception();
     }
 
@@ -306,9 +311,11 @@ impl Env {
         }
         if self.human.pos.distance(start) > WALK_NOISE_MIN_M {
             self.emit(self.human.pos, NoiseKind::Walk);
+            self.stats.walk_noises += 1;
         }
         self.route_noise();
         self.decisions += 1;
+        self.count_decision();
         if self.outcome == Outcome::Running && self.decisions >= self.decision_cap() {
             self.outcome = Outcome::Truncated;
         }
@@ -449,6 +456,7 @@ impl Env {
         if self.human.hunger_s <= 0.5 * dt {
             if self.human.carried > 0 {
                 self.human.carried -= 1;
+                self.stats.eaten += 1;
                 self.human.hunger_s += self.cfg.human.hunger_interval_s;
             } else {
                 return Some(Outcome::Starved);
@@ -556,6 +564,54 @@ impl Env {
         let pos = f.pos;
         self.human.carried += 1;
         self.emit(pos, NoiseKind::Pickup);
+        let heard = self
+            .cfg
+            .noise
+            .food_pickup_radius_m
+            .min(self.cfg.zombie.hearing_radius_m);
+        self.stats.pickups += 1;
+        self.stats.risky_pickups += self.any_zombie_within(pos, heard) as u32;
+    }
+
+    fn any_zombie_within(&self, pos: Vec2, range: f32) -> bool {
+        self.zombies.iter().any(|z| z.pos.distance(pos) <= range)
+    }
+
+    /// Per-decision tactic counters, after the ticks and the noise routing.
+    fn count_decision(&mut self) {
+        let h = self.human.pos;
+        let st = &mut self.stats;
+        st.decisions += 1;
+        st.carried_sum += self.human.carried as f32;
+        st.heavy_decisions += (self.human.carried >= stats::HEAVY_LOAD) as u32;
+        st.inside_decisions += self.map.house_at(h).is_some() as u32;
+        let quiet = self.zombies.iter().all(|z| {
+            z.last_heard_time
+                .is_none_or(|t| self.time - t > stats::QUIET_S)
+        });
+        let positions: Vec<Vec2> = self.zombies.iter().map(|z| z.pos).collect();
+        if quiet && positions.len() >= 2 {
+            st.quiet_dispersion_sum += stats::mean_pairwise_distance(&positions);
+            st.quiet_decisions += 1;
+        }
+        if self.outcome == Outcome::Caught {
+            let close: Vec<Vec2> = positions
+                .iter()
+                .copied()
+                .filter(|p| p.distance(h) <= stats::ENCIRCLE_RANGE_M)
+                .collect();
+            st.catch_close_zombies = close.len() as u32;
+            st.catch_gap_deg = stats::max_angular_gap_deg(h, &close);
+            let mut nearest = positions;
+            nearest.sort_by(|a, b| a.distance(h).total_cmp(&b.distance(h)));
+            nearest.truncate(3);
+            st.catch_sectors = stats::distinct_sectors(h, &nearest);
+        }
+    }
+
+    /// Tactic counters of the current episode (final once the episode has ended).
+    pub fn episode_stats(&self) -> &EpisodeStats {
+        &self.stats
     }
 
     fn close_door(&mut self, house: usize, door: usize) {
@@ -565,6 +621,8 @@ impl Env {
         let pos = h.doors[door].center;
         self.human.door_memory[house] = [h.doors[0].closed, h.doors[1].closed];
         self.emit(pos, NoiseKind::Door);
+        self.stats.door_closes += 1;
+        self.stats.defensive_closes += self.any_zombie_within(pos, stats::DEFENSIVE_CLOSE_M) as u32;
     }
 
     fn emit(&mut self, pos: Vec2, kind: NoiseKind) {

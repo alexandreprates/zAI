@@ -34,6 +34,20 @@ HUMAN = Layout(_SPEC["human"])
 ZOMBIE = Layout(_SPEC["zombie"])
 STATE = Layout(_SPEC["state"])
 
+
+class Stats:
+    """Names of the per-episode tactic counters (`VecStep.final_stats`, `stats.rs`)."""
+
+    def __init__(self, names: list[str]):
+        self.names = list(names)
+        self.index = {n: i for i, n in enumerate(self.names)}
+
+    def get(self, stats: np.ndarray, name: str) -> np.ndarray:
+        return stats[..., self.index[name]]
+
+
+STATS = Stats(zai_sim.STATS_LAYOUT)
+
 # Layout v2 scales (crates/zai-sim/src/obs.rs): landmark deltas are `v / max(|v|, NEAR_M)`
 # with a far distance `|v| / FAR_M`, absolute positions `pos / FAR_M`, time left
 # `(cap - t) / TIME_SCALE_S`.
