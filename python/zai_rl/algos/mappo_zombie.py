@@ -19,7 +19,7 @@ from torch import nn
 
 from zai_env.layout import FAR_M, STATE
 
-from ..envs import ZombieBatch, ZombieTrainingEnv
+from ..envs import ZombieBatch, ZombieStep, ZombieTrainingEnv
 from ..models import ZombieActor, ZombieCritic
 from ..profiling import timer
 from .common import EpisodeStats, RunningMeanStd, bptt_sequences, gae, require_obs_version
@@ -89,92 +89,13 @@ class ZombieMAPPO:
         """Collects `rollout` decisions. `h [A, H]` and `start [A]` carry over between calls;
         `ep_return [A]` accumulates each zombie's return; finished episodes add the mean of
         their zombies' returns to `stats`."""
-        cfg = self.cfg
-        T, L = cfg.rollout, cfg.bptt
-        agent_env = self._t(env.agent_env, torch.long)
-        buf: dict[str, Any] = {
-            k: []
-            for k in (
-                "obs",
-                "state",
-                "actions",
-                "logp",
-                "values",
-                "rewards",
-                "dones",
-                "starts",
-            )
-        }
-        h0 = []
-        nearest = []
-        for t in range(T):
-            nearest.append(nearest_zombie_m(batch.state).mean())
-            with timer("policy"):
-                obs = self._t(batch.obs)
-                state = self._t(batch.state)
-                h = h * (~start).unsqueeze(1)
-                if t % L == 0:
-                    h0.append(h.clone())
-                dist, h_new = self.actor.step(obs, h)
-                actions = dist.sample()
-                logp = dist.log_prob(actions)
-                value = self.value(state[agent_env], obs)
-                actions_np = actions.cpu().numpy()
-
-            step = env.step(actions_np)
-            reward = step.reward.astype(np.float32)
-            ep_return += reward
-            env_done = step.terminated | step.truncated
-            done = env_done[env.agent_env]
-            reward_t = self._t(reward)
-            if step.truncated.any():
-                with timer("policy"):
-                    idx = np.nonzero(step.truncated[env.agent_env])[0]
-                    v_final = self.value(
-                        self._t(step.final_state[env.agent_env[idx]]),
-                        self._t(step.final_obs[idx]),
-                    )
-                    reward_t[idx] += cfg.gamma * v_final
-
-            for k, v in (
-                ("obs", obs),
-                ("state", state),
-                ("actions", actions),
-                ("logp", logp),
-                ("values", value),
-                ("rewards", reward_t),
-                ("dones", self._t(done)),
-                ("starts", start),
-            ):
-                buf[k].append(v)
-
-            if env_done.any():
-                for e in np.nonzero(env_done)[0]:
-                    agents = env.agent_env == e
-                    stats.returns.append(float(ep_return[agents].mean()))
-                    stats.lengths.append(float(step.episode_length[e]))
-                    stats.outcomes.append(int(step.outcome[e]))
-                ep_return[done] = 0.0
-            start = self._t(done, torch.bool)
-            h = h_new
+        ro = ZombieRollout(self, env.agent_env, h, start, ep_return)
+        ro.begin()
+        for _ in range(self.cfg.rollout):
+            step = env.step(ro.act(batch.obs, batch.state))
+            ro.record(step, stats)
             batch = step.next
-
-        rollout = {k: torch.stack(v) for k, v in buf.items()}
-        rollout["h0"] = torch.stack(h0)  # [T/L, A, H]
-        last_value = self.value(self._t(batch.state)[agent_env], self._t(batch.obs))
-        adv, ret = gae(
-            rollout["rewards"],
-            rollout["values"],
-            rollout["dones"],
-            last_value,
-            cfg.gamma,
-            cfg.gae_lambda,
-        )
-        rollout["advantages"], rollout["returns"] = adv, ret
-        rollout["agent_env"] = agent_env
-        # Mean distance from the human to the nearest zombie over the rollout (diagnostic).
-        rollout["nearest_zombie_m"] = torch.tensor(float(np.mean(nearest)))
-        return rollout, batch, h, start
+        return ro.finish(batch.obs, batch.state), batch, ro.h, ro.start
 
     # --- update -------------------------------------------------------------------------
     def update(self, rollout: dict[str, torch.Tensor], progress: float) -> dict[str, float]:
@@ -274,3 +195,109 @@ class ZombieMAPPO:
         self.critic.load_state_dict(sd["critic"])
         self.value_rms.load_state_dict(sd["value_rms"])
         self.optimizer.load_state_dict(sd["optimizer"])
+
+
+class ZombieRollout:
+    """One rollout of the zombie learner, decision by decision (see `HumanRollout`). Agents
+    `[A]` sit on a flat axis with `agent_env [A]`, the index of each agent's env in the
+    learner's env axis `[E]` (per-env arrays such as `state` and `terminated` are `[E]`)."""
+
+    def __init__(
+        self,
+        algo: ZombieMAPPO,
+        agent_env: np.ndarray,
+        h: torch.Tensor,
+        start: torch.Tensor,
+        ep_return: np.ndarray,
+    ):
+        self.algo = algo
+        self.agent_env_np = agent_env
+        self.agent_env = algo._t(agent_env, torch.long)
+        self.h, self.start, self.ep_return = h, start, ep_return
+
+    def begin(self) -> None:
+        self.t = 0
+        self.buf: dict[str, list[torch.Tensor]] = {
+            k: []
+            for k in ("obs", "state", "actions", "logp", "values", "rewards", "dones", "starts")
+        }
+        self.h0: list[torch.Tensor] = []
+        self.nearest: list[float] = []
+
+    @torch.no_grad()
+    def act(self, obs: np.ndarray, state: np.ndarray) -> np.ndarray:
+        algo = self.algo
+        self.nearest.append(float(nearest_zombie_m(state).mean()))
+        with timer("policy"):
+            obs_t = algo._t(obs)
+            state_t = algo._t(state)
+            self.h = self.h * (~self.start).unsqueeze(1)
+            if self.t % algo.cfg.bptt == 0:
+                self.h0.append(self.h.clone())
+            dist, self.h_new = algo.actor.step(obs_t, self.h)
+            actions = dist.sample()
+            logp = dist.log_prob(actions)
+            value = algo.value(state_t[self.agent_env], obs_t)
+            actions_np = actions.cpu().numpy()
+        self.pending = (obs_t, state_t, actions, logp, value)
+        return actions_np
+
+    @torch.no_grad()
+    def record(self, step: ZombieStep, stats: EpisodeStats) -> None:
+        algo, cfg = self.algo, self.algo.cfg
+        agent_env = self.agent_env_np
+        obs_t, state_t, actions, logp, value = self.pending
+        reward = step.reward.astype(np.float32)
+        self.ep_return += reward
+        env_done = step.terminated | step.truncated
+        done = env_done[agent_env]
+        reward_t = algo._t(reward)
+        if step.truncated.any():
+            with timer("policy"):
+                idx = np.nonzero(step.truncated[agent_env])[0]
+                v_final = algo.value(
+                    algo._t(step.final_state[agent_env[idx]]),
+                    algo._t(step.final_obs[idx]),
+                )
+                reward_t[idx] += cfg.gamma * v_final
+        for k, v in (
+            ("obs", obs_t),
+            ("state", state_t),
+            ("actions", actions),
+            ("logp", logp),
+            ("values", value),
+            ("rewards", reward_t),
+            ("dones", algo._t(done)),
+            ("starts", self.start),
+        ):
+            self.buf[k].append(v)
+        if env_done.any():
+            for e in np.nonzero(env_done)[0]:
+                agents = agent_env == e
+                stats.returns.append(float(self.ep_return[agents].mean()))
+                stats.lengths.append(float(step.episode_length[e]))
+                stats.outcomes.append(int(step.outcome[e]))
+            self.ep_return[done] = 0.0
+        self.start = algo._t(done, torch.bool)
+        self.h = self.h_new
+        self.t += 1
+
+    @torch.no_grad()
+    def finish(self, next_obs: np.ndarray, next_state: np.ndarray) -> dict[str, torch.Tensor]:
+        algo, cfg = self.algo, self.algo.cfg
+        rollout = {k: torch.stack(v) for k, v in self.buf.items()}
+        rollout["h0"] = torch.stack(self.h0)  # [T/L, A, H]
+        last_value = algo.value(algo._t(next_state)[self.agent_env], algo._t(next_obs))
+        adv, ret = gae(
+            rollout["rewards"],
+            rollout["values"],
+            rollout["dones"],
+            last_value,
+            cfg.gamma,
+            cfg.gae_lambda,
+        )
+        rollout["advantages"], rollout["returns"] = adv, ret
+        rollout["agent_env"] = self.agent_env
+        # Mean distance from the human to the nearest zombie over the rollout (diagnostic).
+        rollout["nearest_zombie_m"] = torch.tensor(float(np.mean(self.nearest)))
+        return rollout

@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from ..envs import HumanBatch, HumanTrainingEnv
+from ..envs import HumanBatch, HumanStep, HumanTrainingEnv
 from ..models import HumanActor, HumanCritic
 from ..profiling import timer
 from .common import (
@@ -30,6 +30,7 @@ from .common import (
 __all__ = [
     "EpisodeStats",
     "HumanPPO",
+    "HumanRollout",
     "PPOConfig",
     "RunningMeanStd",
     "gae",
@@ -91,82 +92,13 @@ class HumanPPO:
         ep_return: np.ndarray,
         stats: EpisodeStats,
     ) -> tuple[dict[str, torch.Tensor], HumanBatch, torch.Tensor, torch.Tensor]:
-        cfg = self.cfg
-        T, L = cfg.rollout, cfg.bptt
-        buf: dict[str, Any] = {
-            "obs": [],
-            "mask": [],
-            "state": [],
-            "actions": [],
-            "logp": [],
-            "values": [],
-            "rewards": [],
-            "dones": [],
-            "starts": [],
-        }
-        h0 = []
-        for t in range(T):
-            with timer("policy"):
-                obs = self._t(batch.obs)
-                mask = self._t(batch.mask, torch.bool)
-                state = self._t(batch.state)
-                h = h * (~start).unsqueeze(1)
-                if t % L == 0:
-                    h0.append(h.clone())
-                move, interact, h_new = self.actor.step(obs, h, mask)
-                a_move, a_inter = move.sample(), interact.sample()
-                logp = move.log_prob(a_move) + interact.log_prob(a_inter)
-                value = self.value(state)
-                actions = torch.stack([a_move, a_inter], dim=1)
-                actions_np = actions.cpu().numpy()
-
-            step = env.step(actions_np)
-            reward = step.reward.astype(np.float32)
-            ep_return += reward
-            done = step.terminated | step.truncated
-            reward_t = self._t(reward)
-            if step.truncated.any():
-                with timer("policy"):
-                    idx = np.nonzero(step.truncated)[0]
-                    v_final = self.value(self._t(step.final_state[idx]))
-                    reward_t[idx] += cfg.gamma * v_final
-
-            for k, v in (
-                ("obs", obs),
-                ("mask", mask),
-                ("state", state),
-                ("actions", actions),
-                ("logp", logp),
-                ("values", value),
-                ("rewards", reward_t),
-                ("dones", self._t(done)),
-                ("starts", start),
-            ):
-                buf[k].append(v)
-
-            if done.any():
-                for i in np.nonzero(done)[0]:
-                    stats.returns.append(float(ep_return[i]))
-                    stats.lengths.append(float(step.episode_length[i]))
-                    stats.outcomes.append(int(step.outcome[i]))
-                    ep_return[i] = 0.0
-            start = self._t(done, torch.bool)
-            h = h_new
+        ro = HumanRollout(self, h, start, ep_return)
+        ro.begin()
+        for _ in range(self.cfg.rollout):
+            step = env.step(ro.act(batch.obs, batch.mask, batch.state))
+            ro.record(step, stats)
             batch = step.next
-
-        rollout = {k: torch.stack(v) for k, v in buf.items()}
-        rollout["h0"] = torch.stack(h0)  # [T/L, E, H]
-        last_value = self.value(self._t(batch.state))
-        adv, ret = gae(
-            rollout["rewards"],
-            rollout["values"],
-            rollout["dones"],
-            last_value,
-            cfg.gamma,
-            cfg.gae_lambda,
-        )
-        rollout["advantages"], rollout["returns"] = adv, ret
-        return rollout, batch, h, start
+        return ro.finish(batch.state), batch, ro.h, ro.start
 
     # --- update -------------------------------------------------------------------------
     def update(self, rollout: dict[str, torch.Tensor], progress: float) -> dict[str, float]:
@@ -257,3 +189,104 @@ class HumanPPO:
         self.critic.load_state_dict(sd["critic"])
         self.value_rms.load_state_dict(sd["value_rms"])
         self.optimizer.load_state_dict(sd["optimizer"])
+
+
+class HumanRollout:
+    """One rollout of the human learner, decision by decision, so that a caller that steps the
+    environment itself (the league trainer, where both sides act in the same envs) can drive
+    it: `begin()`, then `rollout` times `act(...)` and `record(step, stats)`, then
+    `finish(next_state)`. `h [E, H]`, `start [E]` and `ep_return [E]` carry over between
+    rollouts."""
+
+    def __init__(self, algo: HumanPPO, h: torch.Tensor, start: torch.Tensor, ep_return: np.ndarray):
+        self.algo = algo
+        self.h, self.start, self.ep_return = h, start, ep_return
+
+    def begin(self) -> None:
+        self.t = 0
+        self.buf: dict[str, list[torch.Tensor]] = {
+            k: []
+            for k in (
+                "obs",
+                "mask",
+                "state",
+                "actions",
+                "logp",
+                "values",
+                "rewards",
+                "dones",
+                "starts",
+            )
+        }
+        self.h0: list[torch.Tensor] = []
+
+    @torch.no_grad()
+    def act(self, obs: np.ndarray, mask: np.ndarray, state: np.ndarray) -> np.ndarray:
+        algo = self.algo
+        with timer("policy"):
+            obs_t = algo._t(obs)
+            mask_t = algo._t(mask, torch.bool)
+            state_t = algo._t(state)
+            self.h = self.h * (~self.start).unsqueeze(1)
+            if self.t % algo.cfg.bptt == 0:
+                self.h0.append(self.h.clone())
+            move, interact, self.h_new = algo.actor.step(obs_t, self.h, mask_t)
+            a_move, a_inter = move.sample(), interact.sample()
+            logp = move.log_prob(a_move) + interact.log_prob(a_inter)
+            value = algo.value(state_t)
+            actions = torch.stack([a_move, a_inter], dim=1)
+            actions_np = actions.cpu().numpy()
+        self.pending = (obs_t, mask_t, state_t, actions, logp, value)
+        return actions_np
+
+    @torch.no_grad()
+    def record(self, step: HumanStep, stats: EpisodeStats) -> None:
+        algo, cfg = self.algo, self.algo.cfg
+        obs_t, mask_t, state_t, actions, logp, value = self.pending
+        reward = step.reward.astype(np.float32)
+        self.ep_return += reward
+        done = step.terminated | step.truncated
+        reward_t = algo._t(reward)
+        if step.truncated.any():
+            with timer("policy"):
+                idx = np.nonzero(step.truncated)[0]
+                v_final = algo.value(algo._t(step.final_state[idx]))
+                reward_t[idx] += cfg.gamma * v_final
+        for k, v in (
+            ("obs", obs_t),
+            ("mask", mask_t),
+            ("state", state_t),
+            ("actions", actions),
+            ("logp", logp),
+            ("values", value),
+            ("rewards", reward_t),
+            ("dones", algo._t(done)),
+            ("starts", self.start),
+        ):
+            self.buf[k].append(v)
+        if done.any():
+            for i in np.nonzero(done)[0]:
+                stats.returns.append(float(self.ep_return[i]))
+                stats.lengths.append(float(step.episode_length[i]))
+                stats.outcomes.append(int(step.outcome[i]))
+                self.ep_return[i] = 0.0
+        self.start = algo._t(done, torch.bool)
+        self.h = self.h_new
+        self.t += 1
+
+    @torch.no_grad()
+    def finish(self, next_state: np.ndarray) -> dict[str, torch.Tensor]:
+        algo, cfg = self.algo, self.algo.cfg
+        rollout = {k: torch.stack(v) for k, v in self.buf.items()}
+        rollout["h0"] = torch.stack(self.h0)  # [T/L, E, H]
+        last_value = algo.value(algo._t(next_state))
+        adv, ret = gae(
+            rollout["rewards"],
+            rollout["values"],
+            rollout["dones"],
+            last_value,
+            cfg.gamma,
+            cfg.gae_lambda,
+        )
+        rollout["advantages"], rollout["returns"] = adv, ret
+        return rollout
