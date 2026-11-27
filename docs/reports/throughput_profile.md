@@ -100,3 +100,47 @@ h in the plan, before any of the remaining optimizations.
 
 Decision D5 (optimizations before S1) stands; with the packed GRU done, items 1-3 cover most of
 what is left.
+
+## League rollout optimizations (2026-11-27)
+
+The first short league (`league-s0small-short1`, `s0_small`, 1024 envs in groups B/A/C with
+3/6/9 zombies, 4 resident opponent slots per side) ran at 7.3 k env steps/s. A `cProfile` of
+12 iterations and a per-forward benchmark showed that the rollout is bound by **kernel
+launches**, not by the GPU: an actor's `step` costs ~3-4 ms of CPU time whatever the batch
+(85 to 3 450 rows), against ~1 ms of GPU time for the human, and there are ~8 forward passes
+per decision (two learners, three resident snapshots per side). `torch.distributions`
+argument validation added a synchronization per distribution.
+
+Changes (commit "League: unblock the zombie learner and speed up the rollout"):
+
+1. **CUDA graphs** of the actors' decision step (`zai_rl/models/graphs.py`): both learners
+   (fixed row counts) and every resident opponent slot, with one graph per slot and batch
+   bucket of 128 rows (padded by repeating a row). Graphs read the weights by address, so
+   optimizer steps and lease reloads (an in-place `load_state_dict` into the slot's template)
+   keep them valid. Outputs match eager mode exactly (`tests/test_graphs.py`, GPU only).
+   Replay times: human 768 rows 1.6 ms (eager 4.0), zombies 320 rows 1.2 ms (eager 3.5);
+   the zombie actor is GPU-bound above ~1 000 rows (~1.6 us per row, the learner's 3 450 rows
+   take 6.0 ms either way).
+2. **One device-to-host transfer** per side and decision, queued after both learners' forward
+   passes, and `validate_args=False` in the actors' `Categorical`s.
+3. **Contiguous learner rows**: groups are ordered B, A, C, so the human learner's envs (A+B)
+   and the zombie learner's (A+C) are slices (views, no gather); `final_*` arrays are only
+   concatenated on steps where an episode ended.
+
+Measured with the same config (columns: the short1 run, then 12-iteration runs with changes 2 and 3, and with all three; the zombie learner at 4 epochs instead of 3 adds ~1 s to the update):
+
+| Per iteration (131 072 env steps) | short1 (3 epochs) | 2 + 3 (4 epochs) | 1 + 2 + 3 (4 epochs) |
+|---|---|---|---|
+| Opponents | 5.0 s | 5.5 s | 3.1 s |
+| Learner forward | 3.1 s | 2.0 s | 0.9 s |
+| Glue | 3.5 s | 0.7 s | 0.7 s |
+| Simulation | 1.0 s | 0.95 s | 0.94 s |
+| Update | 5.4 s | 6.5 s | 6.5 s |
+| Throughput | 7.3 k env steps/s | 8.4 k env steps/s | **10.8 k env steps/s** |
+
+With the transfers deferred, "opponents" also includes waiting for the learners' GPU work.
+
+**Not done:** one Rust call for all groups. Simulation is 0.94 s of a ~12 s iteration (8%), so
+merging the 9 `VecEnv` calls would save at most ~0.5 s. The update (now the largest phase,
+mostly the zombie MAPPO update at 4 epochs over ~440 k agent-steps, GPU-bound) and the
+factorized critic first layer (item 1 above) are the next targets if S1 needs them.
