@@ -177,6 +177,8 @@ A zombie hears an event iff `distance(zombie, source) <= min(event_radius, heari
 
 All coordinates are world-frame deltas normalized by the stated range. Variable-size sets are fixed-size padded slots sorted by distance with a validity mask. Encoding lives in Rust (`obs.rs`) and is shared by trainer and server.
 
+The tables below are layout **v1** (current code). Where they say `/500`, the code divides by `map_size_m` (500 only at S2), and the zombie `episode time fraction` is `t / episode_cap_s`. Layout **v2** (constant normalization, house `valid` flags, wall distances; human 608, zombie 276, state 1144) is planned for M6 in section 4.8.2 and replaces these tables when implemented.
+
 **Human actor observation** (flat `float32[584]`, plus action mask):
 
 | Block | Shape | Features |
@@ -290,6 +292,7 @@ Simultaneous training with an opponent pool. Environments are split into groups:
 - Sampling: prioritized fictitious self-play (PFSP), weight `p * (1 - p)` with `p` = current side's recent win rate against that snapshot, so training focuses on opponents it neither always beats nor always loses to.
 - Scripted bots are always in the pool: *scripted zombie* (walk to the most recent heard event, else random waypoint wander), *scripted human* (flee visible zombies closer than 30 m, go to the nearest visible food while carrying fewer than 2 packages, else walk to a random house). The original "food when hunger < 45 s and carrying 0" rule starved: visible food can be 100 m (100 s) away.
 - Imbalance guard: if one side's win rate in group A stays above 85% for 3 consecutive evaluations, the losing side gets an extra update epoch per iteration and the winning side's lr is halved until it recovers.
+- Made concrete for M6 in sections 4.8.4-4.8.5: frozen opponents in resident slots with leases (an opponent never changes inside an episode), snapshot storage under `/checkpoints/league/<run_id>/pool/`, a 20% scripted share, and a proposed change of the PFSP weight to `(1 - p)^2` + 10% uniform (decision D4).
 
 ### 4.4 Curriculum
 
@@ -303,6 +306,8 @@ Stages are advanced by gates measured in the arena against the fixed scripted bo
 
 Within a stage, `noise_localization_sigma` goes 0 -> 0.05. Starting houses/food counts scale with area so densities stay close to S2.
 
+**Revised for M6 (section 4.8.1, proposed):** the curriculum starts at the warm-up stage `s0_small`; the gates become relative to scripted baselines measured at stage start (the absolute "> 60% caught" S0 zombie gate is out of reach: learned zombies caught 1-3.6% on S0), plus balance, forgetting, Elo and exploitability conditions; S0 trains with 4/6/8 zombies; S1 gets 45 food and 8/12/16 zombies. The S2 range above (6-16) predates the default of 20 zombies and should be revisited in M8 (e.g. 12-24 around `ZAI_ZOMBIE_COUNT`).
+
 Budget estimate: S0 ~200 M env steps, S1 ~500 M, S2 1-3 B. At ~70 k env steps/s (section 5.1) that is roughly 1 h, 2 h and 4-12 h respectively on one GPU plus 16-32 CPU cores. On the target P100 server (24 cores, 64 GB RAM) the estimate stays at ~60-100 k env steps/s end-to-end, so S2 takes roughly 3-14 h; measure in M4 before committing to S2 budgets. **Measured in M4:** ~25 k env steps/s end-to-end on the P100 with 1024 envs and 20 simulation threads (section 4.1), about 3x below the estimate, so S1 takes ~6 h and S2 ~11-33 h at the current throughput. Where the time goes (rollout with CPU inference vs the PPO update on the GPU) has not been profiled yet; do it before S1/S2 budgets are committed.
 
 ### 4.5 Evaluation
@@ -310,7 +315,7 @@ Budget estimate: S0 ~200 M env steps, S1 ~500 M, S2 1-3 B. At ~70 k env steps/s 
 Run by the arena every 20 M env steps, on fixed seeds (500 episodes per matchup), at the PRD spec (S2) unless stated.
 
 - **Fixed-opponent evaluation:** latest human vs scripted zombies and vs a frozen "reference" zombie checkpoint per stage; latest zombies vs scripted human and vs a reference human.
-- **Elo:** match outcome is zombie win (catch), human win (survives cap) or draw (human starves). Cross-play between the last 10 snapshots of each side and the scripted bots (anchored at Elo 1000). Reported as Elo curves per side.
+- **Elo:** match outcome is zombie win (catch), human win (survives cap) or draw (human starves). Cross-play between the last 10 snapshots of each side and the scripted bots (anchored at Elo 1000). Reported as Elo curves per side. (Section 4.8.6: cross-play is bipartite, so only one anchor can be fixed; the plan anchors the scripted zombies at 1000 and reports the scripted human's rating as a measured value.)
 - **Exploitability probe** (every 200 M steps): train a fresh best-response for 20 M steps against the frozen latest opponent; a large gap means the latest policy is exploitable (cycling).
 
 Tactic metrics (logged per evaluation, these show *what* is learned, not just reward):
@@ -389,6 +394,244 @@ Observations:
 - The crowd fine-tune is the first run where learned zombies beat a learned human clearly above the scripted baseline (48.7% vs 18.1% with 8-10 zombies). It was stopped at 17 M of the planned 100 M steps with the catch rate still rising, so the next step is to continue it (`--resume`) and then fine-tune the human against the resulting team.
 - Throughput of the crowd fine-tune is ~6 k env steps/s (~54 k agent steps/s at 9 zombies on average), against ~15-16 k env steps/s for the human fine-tune and the 2-4 zombie M5 run: the zombie update scales with the agent count.
 - Every step of this loop trains against a single frozen opponent, so each side can overfit to its current opponent and cycle. Comparing each new checkpoint against older snapshots of the other side is the M6 opponent pool's job (section 4.3) and is not done yet; the `eval_scripted/*` curves only guard against forgetting the scripted bots.
+
+### 4.8 M6 plan: co-training and arena
+
+Status: accepted (2026-11-27) with the recommended option of every decision in 4.8.11; implementation in progress. M6 replaces the manual fine-tune loop of section 4.7 with one league trainer (both learners, env groups A/B/C of section 4.3, snapshot pool with PFSP) and an arena (cross-play Elo, exploitability probe, tactic metrics) whose results reach the viewer. It is split into six sub-milestones, each runnable and testable on its own, in this order: **M6.0** throughput profiling (no behavior change), **M6.1** observation layout v2 and distilled starting checkpoints, **M6.2** Rust episode tactic counters and arena tactic metrics, **M6.3** `MatchTrainingEnv` and the league trainer, **M6.4** arena (Elo, cross-play, probe) and viewer league panel, **M6.5** curriculum gates and the full run s0_small -> S0 -> S1. The observation change comes before any long run because it invalidates every checkpoint (4.8.2); profiling comes first because it is cheap and decides how much optimization work M6.5 needs (4.8.3).
+
+#### 4.8.1 Starting stage and curriculum gates
+
+M6 starts on `s0_small`, the only stage where both sides have competent learned policies (4.6, 4.7). The S0 zombie gate of section 4.4 (catch the scripted human > 60%) is not reachable as written: on S0 the best learned zombies caught the scripted human in 1-3.6% of episodes against a 4.3% scripted baseline with 2-4 zombies, and 4.7 showed that even on `s0_small` the team needed 8-10 zombies to beat a learned human. The gates are therefore relative to baselines measured at the start of each stage on the same seeds (as M5 acceptance was), and S0 is trained with more zombies.
+
+| Stage | Env config | Zombie counts (equal groups) | Budget (min / max env steps) | Starts from |
+|---|---|---|---|---|
+| `s0_small` | `configs/env/s0_small.yaml` (75 m, 3 houses, 50 food, 25 m spawn, 5 min) | 3, 6, 9 | 100 M / 300 M | distilled starters (4.8.2) |
+| S0 | `configs/env/s0.yaml` unchanged (150 m, 3 houses, 20 food, 50 m spawn, 5 min) | 4, 6, 8 (was 2-4) | 100 M / 500 M | latest learners of `s0_small` |
+| S1 | new `configs/env/s1.yaml`: 300 m, 6 houses, 45 food (S2 food density), 75 m spawn, 10 min cap, shaping on, annealed to 0 over the last 40% of the budget | 8, 12, 16 | 200 M / 500 M | latest learners of S0 |
+
+Gate `G(stage)` passes when every condition holds at two consecutive arena evaluations (fixed seeds, 128 episodes per training zombie count, so 384 per matchup; `b_*` are the scripted baselines measured at stage start):
+
+| Condition | `s0_small` -> S0 | S0 -> S1 | S1 -> S2 (reported, not required for M6) |
+|---|---|---|---|
+| Human anchor: latest human vs scripted zombies, survived | >= 80% | >= max(60%, `b_survived` + 10 pts) | as S0 |
+| Zombie anchor: latest zombies vs scripted human, caught | >= 80% | >= max(3 * `b_caught`, `b_caught` + 15 pts), Wilson lower bound above the baseline's upper bound (at `b_caught` = 4.3%: >= 19.3%) | as S0 |
+| Balance: zombie score `s_z = caught + 0.5 * starved` over group A training episodes of the last 20 M steps | within [0.2, 0.8] | within [0.2, 0.8] | within [0.25, 0.75] |
+| No forgetting: each side's mean score against pool snapshots of this stage older than 40 M steps | >= 0.55 | >= 0.55 | >= 0.55 |
+| Elo: each side's latest snapshot vs its stage starter | +100, bootstrap 95% intervals not overlapping | same | same |
+| Exploitability probe gap (4.8.6), both sides | <= 20 pts | <= 20 pts | <= 20 pts |
+| Shaping | on | on | scale 0 for the last 100 M steps |
+
+A gate is only evaluated after the stage's minimum budget. If it has not passed at the maximum budget, the league stops (it does not advance) and reports which conditions failed; that is a user decision point, not an automatic retry. On advancing: the learners keep their weights and `value_rms` (fresh optimizers, learning-rate schedule restarted), the pool is reset to the scripted bots plus the previous stage's final snapshots (protected, tagged with their stage), win-rate statistics are reset, the scripted baselines are re-measured, and Elo restarts as a separate table per stage (ratings are not comparable across maps). The previous stage's final snapshots also become the fixed "reference" opponents of section 4.5 for the new stage.
+
+#### 4.8.2 Observation layout v2: normalization by constants
+
+**Problem.** Every absolute position and house/door delta is divided by `cfg.map_size_m` (`obs.rs`: `let size = cfg.map_size_m`; section 3.6 says `/500`, which was only true at S2). A door 2 m away is 0.027 on `s0_small`, 0.013 on S0 and 0.004 on S2, so the same input means different distances on each stage, which is part of why the M4 human (S0) fell to 15.6% survival on `s0_small` (4.7). The zombie `self.time` field (`time / episode_cap_s`) has the same problem across caps of 5, 10 and 20 min.
+
+**v2 rules.** Two constants in `obs.rs`: `NEAR_M = 100` (vision radius, shaping range) and `FAR_M = 500` (PRD map side). Deltas to static landmarks use `sat(v) = v / max(|v|, NEAR_M)` (linear up to 100 m, then a unit direction), plus a far-scale distance `|v| / FAR_M`, so precision near the agent is the same on every map and far landmarks keep their direction and distance. Absolute positions are `pos / FAR_M`. Boundary awareness comes from four wall distances `min(d, NEAR_M) / NEAR_M`. A new `OBS_VERSION = 2` constant is exported by `zai_sim`, saved in checkpoints and ONNX metadata, and checked on load (`from_checkpoint`, `export_model`, server `policy.rs`).
+
+| Vector | Block (v1 -> v2) | v2 fields |
+|---|---|---|
+| Human obs (584 -> **608**) | self 16 -> **20** | `x, y` (`/500`), `wall_w, wall_e, wall_s, wall_n`, heading sin/cos, `vx, vy`, `carried`, one-hot `carried_0..5`, `hunger`, `inside`, `since_noise` |
+| | zombies 32 x 6, food 16 x 4, rays 64 x 3 | unchanged (already `/vision_radius`, `/speed`) |
+| | houses 10 x 12 -> 10 x **14** | `valid` (new; replaces the `abs().sum() > 0` test in the actors), `dx, dy` = `sat(center - pos)`, `dist` = `|center - pos| / 500`, rot sin/cos, `front_dx, front_dy`, `back_dx, back_dy` (`sat`), `front_closed`, `back_closed`, `door_visible`, `inside` |
+| | starts | self 0, zombies 20, food 212, houses 276, rays 416 |
+| Zombie obs (252 -> **276**) | self 12 -> **16** | `x, y` (`/500`), `wall_w, wall_e, wall_s, wall_n`, heading sin/cos, `vx, vy`, `inside`, `blocked`, `since_heard`, `num_zombies`, `time_left` = `(cap - t) / 1200` (replaces `t / cap`), `bias` |
+| | heard 8 x 9, peers 8 x 5, rays 16 x 3 | unchanged (`/300`, `/50`, `/10`) |
+| | houses 10 x 8 -> 10 x **10** | `valid`, `dx, dy` (`sat`), `dist` (`/500`), rot sin/cos, `front_dx, front_dy`, `back_dx, back_dy` (`sat`) |
+| | starts | self 0, heard 16, peers 88, houses 128, rays 228 |
+| State (1144, unchanged size) | human, zombies, food, houses | all positions `/500`; `zombies.dist_to_human` = `min(d, 100) / 100` (the shaping potential's own scale) |
+| | time 4 | `time` (`t / cap`), `time_left` (`(cap - t) / 1200`, replaces `bias`), `num_zombies`, `active_food` |
+
+The actors exclude `self.x, self.y` from their input by default (a column selection in `HumanActor` / `ZombieActor`, not a layout change): absolute position would be out of distribution on every larger map, while houses already act as landmarks. The fields stay in the layout for the Python scripted bots, diagnostics and the adapter below. `train/nearest_zombie_m` must be computed from state positions (`* 500`), since `dist_to_human` now saturates at 100 m.
+
+**What this invalidates.** Every human and zombie checkpoint (input dims change), every ONNX model in `data/models/` (the server already rejects them on `obs_dim`; move them to `data/models/legacy/` so the viewer does not list them), the policy parity fixtures (`python -m arena.export_model --parity-fixtures crates/zai-server/tests/fixtures`, since `obs_dim` changes), the Python scripted bots (they read `self.x/y` and `houses.dx * map_size`; they must read meters from the new fields, and their baselines are re-measured), and the `layout_fields_match_the_writers` test. Replays stay valid: they store actions and the dynamics do not change, which a test re-simulating an existing replay file to its stored `state_hash` must confirm.
+
+**Cheapest new starting checkpoints: distillation through an adapter (about 1 h of GPU time instead of about 8 h).** v2 keeps enough information to rebuild v1 on maps up to about 140 m: `x/size = (x/500) * 500 / size`, house deltas = direction x far distance, `time / cap` from `time_left`, state positions rescaled and `dist_to_human` from positions. Door deltas beyond 100 m saturate; the adapter then uses the house-center distance (at most ~4 m error, and only on a 75 m map when the human is more than 100 m from a door). `zai_env.legacy.adapt_v1(obs_v2, config)` lets the old frozen actors and critics play in the v2 env, and `python -m zai_rl.distill` trains a fresh v2 actor and critic on them:
+- On-policy DAgger: each env's episode is driven by the teacher with probability `beta` (1 -> 0 over the first 30% of steps), otherwise by the student. Loss: `KL(teacher || student)` over masked logits (both human heads), on 64-step BPTT chunks; critic: MSE to the teacher's normalized value on `adapt_v1(state)`, `value_rms` copied from the teacher.
+- Opponents: half of the envs against the other side's teacher (through the adapter), half against the scripted bot of the other side. Counts as in the `s0_small` stage.
+- Teachers: human `human-s0small-ft1/final.pt` (main starter), zombies `zombie-s0small-crowd-ft1/latest.pt` (main starter, stopped at 17 M; resuming it on v1 first would cost ~4 h for a policy the league continues anyway), plus `zombie-s0small-gpu1` (M5) and `human-s0-gpu1` (M4) as extra pool seeds (the M4 human also seeds S0).
+- Budget: 10 M env steps per teacher (~10 min each at ~20 k env steps/s; only a forward pass for the teacher and a supervised backward pass for the student).
+- Acceptance per student, 512 fixed-seed episodes per count: outcome rates against the scripted bot and against the other main teacher within 3 points of the teacher's (with overlapping Wilson intervals), mean per-decision KL < 0.05.
+
+Alternatives: train both sides from scratch inside the league (validates the league end to end but costs an unknown number of hours with a cold pool and zombies that get no signal from a starving random human, 4.6); or re-run the M4/M5/4.7 recipes on v2 (~8 h of GPU time across five runs).
+
+#### 4.8.3 Throughput: profiling and optimizations
+
+**What is known.** End-to-end on the P100 (1024 envs, 20 simulation threads): 25 k env steps/s for the human vs scripted zombies (5.3 s per 131 k-step iteration), 15.8 k for zombies with 2-4 agents (8.3 s per iteration, wall time including evaluation) and ~6 k with 8-10 agents (22 s). From those two zombie runs, each zombie agent costs ~2.2 ms per iteration (~17 us per agent decision, rollout inference plus update), with a fixed cost of about 1.5 s per iteration (simulation, glue code, scripted opponent). `perf/steps_per_s` excludes evaluation, replay and checkpoint time (it is measured before them), so the wall clock is 5-10% slower than logged. The raw simulation (9.2 us per decision step per core, M1) is not the bottleneck: 1024 envs on 20 cores take ~0.5-1 ms per step, ~0.1 s per 128-step rollout.
+
+**M6.0 profiling (GPU server, about 1 h, no behavior change).**
+1. Read `perf/rollout_s`, `perf/update_s` and the wall time between metric points of `human-s0-gpu1`, `zombie-s0small-gpu1` and `zombie-s0small-crowd-ft1` from the metrics database (`GET /api/metrics?run_id=<id>&keys=perf/rollout_s,perf/update_s,perf/steps_per_s`). The wall-time gaps give the evaluation overhead.
+2. Add finer timers, logged as `perf/*` by both current trainers: `sim_s` (time inside `VecEnv.step`), `opponent_s` (bot or frozen policy `act`), `policy_s` (learner forward including host-to-device and device-to-host copies, with `torch.cuda.synchronize()` around it on profiling runs only), `glue_s` (rest of the rollout: `np.concatenate`, `.copy()`, list appends), `update_s` split into `update_gather_s` (state gather) and `update_step_s`, plus `eval_s`, `replay_s` and `checkpoint_s`.
+3. One `torch.profiler` trace of a single iteration per trainer (`record_function` ranges for the phases above), plus `nvidia-smi dmon -s u` and per-core CPU utilization sampled across one iteration. The expected pattern: 20 cores idle during the update and the GPU idle during the rollout.
+4. Write the result to `docs/reports/throughput_profile.md` and replace the budget estimates below with the measured ones.
+
+**Optimizations to consider (in expected order of payoff; each is checked for equal learning curves on `s0_small` at 20 M steps):**
+1. **Factorized zombie critic first layer.** `W1 [s; o] = W_s s + W_o o`: compute `W_s s` once per (t, env), `[T, E, 512]`, and gather it per agent, instead of gathering `[mb, 64, 1144]` states (675 MB per minibatch at 9 zombies) and multiplying per agent. Mathematically identical (existing critic weights split into `W_s`, `W_o`); it removes ~65% of the critic's first-layer FLOPs at 6 zombies and more at higher counts.
+2. **One Rust call per step for all groups.** Today each group is a separate `VecEnv` (own rayon pool) stepped one after another from Python, with per-group `np.concatenate`; M6 has 9+ groups (A/B/C x 3 counts), so each parallel loop gets ~100 envs over 20 threads and the copies grow. Add `zai_sim.VecEnv.from_groups([(config, num_envs), ...])`: one env list with per-env configs, one parallel loop, zombie obs written directly on the flat agent axis `[A, 276]` with `agent_env`, and no Python concatenation.
+3. **Preallocated rollout tensors and pinned copies.** Replace the per-step lists plus `torch.stack` (a second copy of ~1.2 GB of zombie observations per iteration) with `[T, ...]` tensors filled in place; copy VecEnv buffers through a pinned staging tensor with `non_blocking=True`.
+4. **Evaluation out of the training loop.** The arena (4.8.6) does the fixed-seed evaluations in its own process; the league trainer only logs training-episode outcomes and tactic counters, which come for free.
+5. **Zombie update subsampling.** Use a random 50% of the zombie sequences per epoch (transitions of zombies in the same env are strongly correlated). This changes the algorithm, so it must show equal curves before adoption.
+6. **CUDA graphs for the fixed-shape rollout forward passes.** Learner batch sizes are static. `torch.compile` is not an option: Triton (the inductor GPU backend) requires compute capability 7.0, and the P100 is 6.0.
+7. Later, if still bound by the update: overlap the next rollout with the current update (one-iteration policy lag, corrected by the PPO ratio). Not planned for M6.
+
+**Budget estimates for co-training on the P100** (model: 1.5 s fixed + 2.9 s human learner on 75% of the envs + 2.2 ms per learner zombie agent on 75% of the agents + 0.3 s frozen inference, per 131 k env-step iteration; "improved" assumes optimizations 1-4 cut the per-agent cost to 1.0 ms and the fixed and human parts to 1.0 s and 2.0 s):
+
+| Stage | Mean zombies | Env steps | Current: env steps/s, time | Improved: env steps/s, time |
+|---|---|---|---|---|
+| `s0_small` | 6 | 200 M | ~8.9 k, ~6 h | ~16.6 k, ~3.3 h |
+| S0 | 6 | 300 M | ~8.9 k, ~9.4 h | ~16.6 k, ~5 h |
+| S1 | 12 | 500 M | ~5.2 k, ~27 h | ~10.5 k, ~13 h |
+| S2 (M8, for reference) | 18 | 1-3 B | ~3.7 k, 3-9 days | ~7.7 k, 1.5-4.5 days |
+
+M6 in total (three stages) is about 42 h at the current throughput and about 22 h improved, plus ~10% for the arena and about 1 h per exploitability probe. Optimizations 1-4 are therefore recommended before S1; S2 (M8) is not practical without them.
+
+#### 4.8.4 `MatchTrainingEnv` and the league trainer
+
+**Environment.** `envs.MatchTrainingEnv(config, groups, pool_sides, seed, num_threads)` with `groups` a list of `GroupSpec(kind in {A, B, C}, zombie_count, num_envs)`. Defaults: A 50%, B 25%, C 25% of `num_envs`, each split equally across the stage's zombie counts (`group_sizes`), so 9 groups. Env axis `[E]` ordered by kind, then count. Static index arrays built once:
+- `human_env [E_h]`: envs of A and B (human learner rows); `zombie_env [E_z]`: envs of A and C; `agent_env [A_z]`: for each learner zombie, its row in `zombie_env` (zombie `n` of env `e`, as in M5), so the MAPPO buffers stay `[T, A_z, ...]` with state stored per env `[T, E_z, 1144]`.
+- Opponent rows: zombies of group B envs (`[A_B]`) and humans of group C envs (`[E_C]`), each with a per-env `slot [E]` index (below).
+- `step(human_actions [E_h, 2], zombie_actions [A_z]) -> MatchStep` holding `human: HumanStep` (rows `E_h`), `zombie: ZombieStep` (rows `A_z`, `final_obs`, `final_state`), and `episodes`: one record per finished env with `(env, kind, zombie_count, opponent_id, outcome, length, stats)`, where `stats` is the Rust tactic-counter row (4.8.6).
+- `HumanTrainingEnv` and `ZombieTrainingEnv` become thin wrappers (all envs of kind B or C, with the opponent factory as a single pinned slot), so `train.py` and `train_zombie.py` keep working unchanged. A test checks that the wrappers produce the same trajectories as the current classes for the same seeds.
+
+**Frozen opponents batched per slot.** Each opponent side has `K = 4` resident slots (configurable): each slot holds one pool entry, a frozen actor on the GPU or a scripted bot. Every opponent row carries its env's slot id, assigned at episode start. Per step, for each resident actor slot `k`: `idx = (slot == k).nonzero()`, then `actor_k.step(obs[idx], h[idx])`, scattered back; that is at most 4 small forward passes per side (stacking the slot weights with `torch.func.stack_module_state` + `vmap` is a later option if profiling shows it matters). Hidden states live in one `[rows, H]` tensor per side (one hidden size per side within a league, checked on load) and are cleared at episode end. Scripted slots: one bot instance per VecEnv group acts on all envs of the group each step and only the rows assigned to the slot are used (the bots are vectorized numpy and keep per-env waypoints, which reset harmlessly). **Leases:** every `lease_iters = 5` iterations, the oldest non-scripted slot starts draining: no new episodes are assigned to it, and when its last episode ends it is reloaded with a new PFSP sample from the pool (4.8.5). On S0, a slot drains in at most 600 decisions (about 5 iterations). An opponent therefore never changes within an episode, so win-rate bookkeeping and hidden states stay consistent. Episode start: a slot is drawn with probability proportional to the PFSP weight of its entry among the non-draining slots. Slot 0 of each side is pinned to the scripted bot with a fixed 20% share of the B/C episodes (scripted bots are always in the pool; this also keeps the anchors of the gates trained against).
+
+**Co-training loop (`zai_rl.train_league`, one process, one GPU).** `HumanPPO.collect` and `ZombieMAPPO.collect` are split into `begin(T)`, `act(batch) -> (actions, aux)`, `record(step, aux)` and `finish(next_batch) -> rollout` (GAE, truncation bootstrap) over preallocated buffers. The existing `collect` methods become a loop over these four calls (same results, checked by test). Per iteration: 128 x (`human.act`, `zombie.act`, opponent slots act, `env.step`, both `record`), then `finish` and `update` for both learners sequentially on the GPU, then league bookkeeping (pool statistics, leases, guard, snapshots). Iteration size at E = 1024: human 768 x 128 = 98 k transitions, zombies 0.75 x 1024 x mean count x 128 (590 k at 6 zombies). `update()` gains `epochs` and `lr_scale` overrides for the imbalance guard. `total_steps` counts env steps over all groups; each learner logs its own transition count.
+
+**Checkpoint layout.** Learner checkpoints stay where the existing tools look for them, and league state is separate:
+
+```
+/checkpoints/human/<run_id>/{latest.pt, itNNNNNN.pt}    # HumanPPO.state_dict + extra (as today, + obs_version, stage)
+/checkpoints/zombie/<run_id>/{latest.pt, itNNNNNN.pt}   # ZombieMAPPO.state_dict + extra
+/checkpoints/league/<run_id>/
+  league.pt              # iteration, steps, stage index, pool statistics, slot leases, guard state, RNG states
+  pool.json              # snapshot index (also read by the arena)
+  pool/human/h0007.pt    # actor only: {actor, hidden, obs_version, side, steps, stage, source}  (~2.8 MB)
+  pool/zombie/z0007.pt   # (~0.7 MB)
+  crossplay.jsonl        # arena results, append-only
+<ZAI_DATA_DIR>/leagues/<run_id>/{pool.json, arena.json}   # copies for the viewer (4.8.6)
+```
+
+`--resume /checkpoints/league/<run_id>/league.pt` restores both learners from their `latest.pt`. Exported ONNX models need distinct ids because both sides share the run id: `<run_id>-human` and `<run_id>-zombie` (`export_training_model` currently uses `run_id`, so the two would overwrite each other). Training replays (`record_training_replays`, `match_id = run_id`) play the latest human against the latest zombies.
+
+#### 4.8.5 Snapshot pool and PFSP
+
+- **Entries:** `{id, side, path, steps, stage, source: league | distilled | scripted | random, protected, created}`. Scripted bots are entries without a path. Random bots are Elo-only (floor), never sampled for training.
+- **Snapshots:** each learner's actor every `snapshot_every_steps` (20 M on S0/S1, 10 M on `s0_small`; at ~9 k env steps/s that is one every 20-35 min), and always at a stage end. Seed entries per stage: the scripted bot, the stage starter, and the previous stage's final snapshot (on `s0_small`, the four distilled teachers).
+- **Eviction:** cap of 50 per side; protected entries are scripted bots, seeds, stage finals and every 10th snapshot; when over the cap, the oldest unprotected entry is evicted (its file is kept on disk, but it no longer appears in `pool.json` for sampling).
+- **Win-rate bookkeeping** (trainer side, from group B/C training episodes): score 1 for a learner win, 0.5 for a starvation draw, 0 for a loss (same scoring as Elo, section 7 #16). Each `(learner side, entry)` pair holds decayed sums `n <- 0.98 n + games`, `w <- 0.98 w + score` per iteration, and the estimate is `p = (w + 1) / (n + 2)` (prior 0.5). This measures the current stochastic learner against the entry under training conditions; Elo (4.8.6) is the fixed-seed measurement.
+- **PFSP weight** when a lease is renewed: `f(p) = (1 - p)^2` ("hard" PFSP, AlphaStar), mixed with 10% uniform over the stage's entries. Section 4.3's `p (1 - p)` gives zero weight to entries the learner never beats, which is exactly the forgetting case the pool is meant to catch; it stays available as `pfsp: variance` for ablation.
+- **Imbalance guard** (4.3, made concrete): every 10 iterations compute `s_z` over group A episodes. If `s_z > 0.85` for 3 consecutive windows, the human gets +1 update epoch and the zombies' lr is multiplied by 0.5; symmetric if `s_z < 0.15`. The guard is released when `s_z` returns to [0.3, 0.7]. It is logged as `league/guard` (-1, 0, +1). If more than 50% of group A episodes end in starvation for 3 windows, the trainer logs `league/starvation_alarm`, because zombies get no reward for starvation (section 3.8) and the league is drifting towards risk 2 of section 8.
+
+#### 4.8.6 Arena: Elo, exploitability probe, tactic metrics
+
+**Process.** `python -m arena.league --run-id <id>` runs as a second process in the trainer container (`make arena-gpu`), on the same GPU (small batches) with 3 simulation threads (the league trainer drops to 17). It watches `pool.json`, plays each new snapshot against the **Elo set** of the other side (the last 10 snapshots of the stage, scripted, random, the stage's references) with `arena.matches.play` extended to return per-episode outcomes and tactic rows. That is 128 episodes per training zombie count on fixed seeds per matchup; results are appended to `crossplay.jsonl` and never recomputed. Cost: a new human/zombie snapshot pair needs ~26 matchups, about 2-4 min on S0, so the arena stays idle most of the time between snapshots.
+
+**Elo.** Bradley-Terry maximum likelihood on episode scores (win 1, starvation 0.5, loss 0), on the Elo scale (`400 log10`), fitted over the whole stage table at each update (order-independent, unlike sequential Elo updates), with a weak Gaussian prior (sigma 400) for entries with few games. Cross-play is bipartite (humans only play zombies), so the ratings have a single free offset: **one anchor**, the scripted zombies at 1000. The scripted human's rating is then a measured number (it reflects game balance as much as skill). This refines section 4.5, which anchored both scripted bots at 1000, and that is over-determined. 95% intervals come from 200 bootstrap resamples over episodes. Elo assumes transitivity, so the viewer also shows the raw cross-play matrix, where cycles are visible.
+
+**Exploitability probe.** Run at every gate check and every 200 M env steps. For each side, start from the learner's own latest checkpoint (`init_checkpoint`), fine-tune against the frozen latest opponent for 10 M env steps with the existing single-side trainers (`opponent: policy`, lr 1e-4, configs `configs/train/probe_{human,zombie}.yaml`), then compare: gap = probe score - learner score against that opponent, on the arena's fixed seeds. A from-scratch best response is not feasible at this budget (M4 needed 18 M steps just to beat the scripted baseline). Cost: ~15-25 min per side. During a probe the league trainer runs with 10 simulation threads (or pauses at gates). The probe's final checkpoints go into the pool as protected `source: probe` entries (exploiters, as in AlphaStar).
+
+**Tactic metrics (subset of 4.5).** Counters are accumulated in Rust during `Env::step`, so they are free for every training episode and identical in the server. They live in a new `crates/zai-sim/src/stats.rs`: `EpisodeStats`, exported with a `STATS_LAYOUT` table like the obs layouts, `Env::episode_stats()`, and `VecEnv` `final_stats [E, K]` (rows valid where an episode ended, K ~ 24). Python aggregates them (means, percentiles, Wilson or bootstrap intervals). Each counter gets a Rust rule test on an arranged state.
+
+| Priority | Side | Metric | Where |
+|---|---|---|---|
+| P1 | Human | Survival time p10 / median / p90, by cause | Python (outcome, length) |
+| P1 | Human | Food: packages picked, eaten from inventory, mean carried, fraction of time with `carried >= 3` | Rust |
+| P1 | Human | Noise: events per minute by type; risky pickups (a zombie within 100 m, i.e. one hears it) per episode | Rust |
+| P1 | Human | Doors: closes per episode; defensive closes (a zombie within 30 m of the door at close time) | Rust |
+| P1 | Human | Fraction of time inside houses | Rust |
+| P1 | Zombies | Catch rate and time to catch per count (exists) | Python |
+| P1 | Zombies | Encirclement at catch: maximum angular gap of the zombies within 50 m of the human at the catching tick (mean), and the fraction of catches with gap < 120 degrees | Rust |
+| P1 | Zombies | Flanking at catch: distinct 8-sectors of the 3 nearest zombies at the catching tick | Rust |
+| P1 | Zombies | Search dispersion: mean pairwise distance over decisions in which no zombie heard anything in the last 30 s | Rust |
+| P2 | Human | Escapes through the opposite door within 20 s of a close; zombie distance when entering a house | Rust |
+| P2 | Zombies | Noise response (fraction of hearers that close >= 5 m on the source within 10 s, i.e. responders vs sentinels); door coverage; flanking over the 30 s before a catch (ring buffer) | Rust |
+
+Baselines for every metric: scripted vs scripted and random, measured at stage start (`tactics/baseline_*`).
+
+**How results reach the viewer.**
+- Scalars: the trainer posts under `run_id` with models `human` and `zombie` (two `MetricsLogger`s); the arena posts with model `arena` (already accepted by `metrics.rs`) under the same `run_id`, at the snapshot's env step, so one run in the viewer shows all three. No schema change in `metrics.rs`.
+- Tables that are not time series (snapshot list with Elo and intervals, cross-play matrix, PFSP weights, gate checklist, stage history): `pool.json` (trainer) and `arena.json` (arena) under `<ZAI_DATA_DIR>/leagues/<run_id>/`, served merged by a new `GET /api/leagues` and `GET /api/leagues/{id}` in `api.rs`, mirrored in `web/src/types.ts`.
+- Web: `charts.ts` gets `/gate/`, `/anchor/`, `/elo/` and `/tactics/` at the front of `ORDER`; the key conventions below reuse the existing `baseline_`, `_lo` / `_hi` and `_zN` grouping. A new `web/src/league.ts` panel (shown when `/api/leagues/{id}` exists for the selected run) draws the cross-play heatmap (human snapshots x zombie snapshots, cell = human score), the snapshot table, the PFSP weights and the gate checklist.
+
+**Metric keys** (new; the existing `train/*`, `episode/*` and `perf/*` stay):
+
+| Model | Keys |
+|---|---|
+| `human`, `zombie` (trainer) | `episode_A/{caught,starved,survived}`, `league/{stage,guard,starvation_alarm}`, `pool/{size,pfsp_entropy,score_min,score_mean}`, `tactics_train/<metric>`, `perf/{sim_s,opponent_s,policy_s,glue_s,update_gather_s,update_step_s}` |
+| `arena` | `elo/human`, `elo/zombie` (+ `_lo`, `_hi`), `elo/baseline_human` (scripted human, drawn on the `elo/human` chart), `anchor/survived` and `anchor/caught` (+ `baseline_`, `_lo`, `_hi`, `_zN`), `xplay/{human,zombie}_score_vs_old`, `probe/{human,zombie}_gap`, `gate/<condition>` (margin to the threshold, > 0 passes) and `gate/passed`, `tactics/<metric>` (+ `baseline_`, `_lo`, `_hi`) |
+
+#### 4.8.7 Reuse and new code
+
+| Piece | Existing code | M6 action |
+|---|---|---|
+| Env groups, fixed opponents | `envs.HumanTrainingEnv`, `envs.ZombieTrainingEnv`, `group_sizes` | New `MatchTrainingEnv` (4.8.4); the two classes become wrappers, with a trajectory-equality test. |
+| Rollout loops | `HumanPPO.collect`, `ZombieMAPPO.collect` | Split into `begin/act/record/finish` over preallocated buffers; `collect` kept as a loop over them (equality test). |
+| Updates | `HumanPPO.update`, `ZombieMAPPO.update` | Unchanged except `epochs` / `lr_scale` overrides; `ZombieCritic` gets the factorized first layer (weight-compatible). |
+| GAE, BPTT, `RunningMeanStd`, `save_checkpoint` | `algos/common.py` | Reused; `save_checkpoint` adds `obs_version`. |
+| Frozen policies | `policy.RecurrentHumanPolicy`, `RecurrentZombiePolicy` (`from_checkpoint`) | Reused for loading; new `league/slots.py` (`OpponentSlots`: resident slots, row indices, hidden states, leases). |
+| Config loading | `TrainConfig.load`, `ZombieTrainConfig.load` | New `LeagueConfig` (`human: PPOConfig`, `zombie: MAPPOConfig`, `league:`, `stages:`), same unknown-key check; configs `configs/train/league_{cpu,gpu}.yaml`. |
+| Entrypoint | `train.py`, `train_zombie.py` | New `zai_rl/train_league.py`; Makefile `train-league`, `train-league-gpu`, `arena-gpu`, `distill-gpu`. |
+| Wilson, per-count catch rates | `train_zombie.wilson`, `catch_rates` | Move to `arena/stats.py`, shared by the trainers and the arena. |
+| Batched matches | `arena.matches.play` | Add `play_detailed` returning per-episode outcome, length and tactic rows; `MatchStats` unchanged. |
+| Pool, Elo, scheduler | (planned in section 2 as `league/{pool,elo,scheduler}.py`) | New: `league/pool.py` (index, eviction, decayed scores, PFSP), `league/elo.py` (Bradley-Terry fit, bootstrap), `league/scheduler.py` (group layout, guard, gates, stage advance). |
+| Arena | `arena/` (balance sweep, export) | New `arena/league.py` (watcher, cross-play, Elo, `arena.json`, metrics) and `arena/probe.py` (launches the single-side trainers). |
+| Metrics | `MetricsLogger` | Reused (two trainer instances plus one arena instance). |
+| Model export, replays | `export_training_model`, `record_training_replays` | Reused; ids `<run_id>-human` / `<run_id>-zombie`; metadata gains `obs_version`. |
+| Observation encoders | `obs.rs` | Layout v2 (4.8.2), `OBS_VERSION`; `layout_tests` updated. |
+| Tactic counters | none | New `stats.rs` (`EpisodeStats`, `STATS_LAYOUT`), `VecEnv.final_stats`, `zai_env.layout.STATS`. |
+| Vector env | `zai-py` `VecEnv` | `final_stats`; `VecEnv.from_groups` (one call for all groups) after M6.0 confirms the gain. |
+| Legacy adapter, distillation | none | New `zai_env/legacy.py` (`adapt_v1`), `zai_rl/distill.py`. |
+| Server | `policy.rs` (`obs_dim` check), `api.rs`, `metrics.rs` | `obs_version` check; `GET /api/leagues{,/{id}}`; `metrics.rs` unchanged. |
+| Viewer | `charts.ts`, `types.ts` | `ORDER` entries; new `league.ts`; types mirrored. |
+| Python bots | `bots/scripted_{human,zombie}.py` | Read meters from the v2 fields (absolute `x, y` now `/500`); a test checks that they choose the same actions as v1 on the same states (through the adapter). |
+
+#### 4.8.8 Acceptance criteria for M6
+
+1. **Layout v2 and starters:** all Rust and Python tests pass; parity fixtures are regenerated and `tests/policy_parity.rs` passes; an existing replay re-simulates to its stored `state_hash`; each distilled starter meets 4.8.2 (outcomes within 3 points of its teacher, KL < 0.05).
+2. **Profiling:** `docs/reports/throughput_profile.md` with the per-phase split of the three reference runs and of a league iteration; the budget table above updated with measured numbers.
+3. **League mechanics:** one `train_league` process trains both sides with groups A/B/C, slot leases, PFSP and the guard, and resumes from `league.pt` with identical pool state.
+4. **Curriculum:** the league passes `G(s0_small)` and `G(S0)` (4.8.1) within their maximum budgets and advances automatically.
+5. **Elo improvement against fixed anchors (the row-9 criterion, made measurable):** on S1, the latest snapshot of each side is at least +100 Elo above its S1 starter, with non-overlapping bootstrap intervals, and both anchor conditions of the S0 -> S1 gate hold on S1. Passing `G(S1)` is reported but not required; S1 continues in M8 if needed.
+6. **No cycling:** at the end of each stage, `xplay/*_score_vs_old` >= 0.55 for both sides and the probe gap <= 20 points.
+7. **Tactics:** on the last stage reached, at least two P1 tactic metrics per side differ from the scripted baseline in the intended direction with non-overlapping 95% intervals (for example: more defensive closes and fewer risky pickups for the human; more encirclement at catch and higher search dispersion for the zombies).
+8. **Viewer:** the run page shows the Elo curves with intervals, anchors, gates, tactic charts with baselines, the cross-play heatmap and the snapshot table, live while the league runs.
+
+#### 4.8.9 Staged rollout and de-risking before GPU runs
+
+1. **Before touching `obs.rs`** (CPU, minutes): dump v1 observations, states and actions for 3 episodes per stage config from the current build into `python/tests/fixtures/obs_v1.npz`. After v2 lands, re-simulate the same seeds and actions and check `adapt_v1(v2) == v1` (atol 1e-5 on `s0_small`; door deltas beyond 100 m excepted on S0). This is the only cheap way to prove that the teachers see their own input distribution.
+2. **CPU tests (pilot, minutes):** layout v2 tests; wrapper trajectory equality; `act/record/finish` equals `collect`; `MatchTrainingEnv` index round-trips (human rows, flat agents, opponent rows); slot draining never switches an opponent inside an episode; PFSP sampling frequencies match the weights (chi-square); the Elo fit recovers ratings on synthetic Bradley-Terry data within 30 points; decayed score bookkeeping; one Rust rule test per tactic counter; guard state machine; `league.pt` resume round-trip.
+3. **CPU pilot run (Apple Silicon, ~30 min):** `league_cpu.yaml`, 128 envs, `s0_small`, 2 M env steps, pool seeded only with scripted bots and snapshots every 0.5 M steps; the arena running alongside. Go if nothing crashes, the pool grows, leases rotate, `arena.json` fills in and the viewer panels render.
+4. **GPU profiling (M6.0, ~1 h):** as in 4.8.3, on the current code. Implement the optimizations chosen (decision 5 below) and re-measure before M6.5.
+5. **GPU distillation (M6.1, ~1 h):** four teachers, acceptance as in 4.8.2.
+6. **Short GPU league (~1-2 h, 30-50 M env steps on `s0_small`):** go if both critics' explained variance > 0.2, `s_z` stays within [0.1, 0.9], PFSP weights are not uniform after 20 M steps, the arena lags by at most one snapshot, throughput is within 20% of the estimate, and neither side's anchor score drops more than 10 points below its starter.
+7. **Full run (M6.5, ~1-2 days):** `s0_small` -> S0 -> S1 with gates and probes; stop at any gate that fails at its maximum budget.
+
+#### 4.8.10 Risks
+
+- **S0 catchability against a learned human** (risk 1 of section 8, still open): the S0 zombie gate may not pass even with 4-8 zombies. Fallbacks, in order: `food_near_spawn_count: 3` on S0 (early pickup noise, as on `s0_small`); an intermediate 110 m stage; higher counts. Each is a user decision at the failed gate.
+- **Simultaneous learning instability in group A** (both sides chasing each other): mitigated by groups B/C, the guard, and lower learning rates (start at the fine-tune values 1e-4 / 1.5e-4).
+- **Cold pool:** early in a stage the pool holds only seeds, so PFSP has little to choose from; the 20% scripted share and the distilled seeds cover this.
+- **Distillation fidelity of recurrent teachers:** the teacher's hidden state comes from its own adapted observations, the student's from v2. DAgger keeps the student's state distribution on-policy; if KL stays high, the fallback is retraining with the M4/M5 recipes (~8 h).
+- **Arena and probe contention** with the trainer for cores and the GPU: thread budgets are fixed (17 / 3 / 4 torch), and probes run at gates or with the league slowed.
+- **Non-transitivity:** Elo hides cycles; the cross-play matrix and the forgetting check are the guard, not Elo alone.
+- **Starvation-dominated outcomes** (risk 2 of section 8): visible as `league/starvation_alarm`; zombies get no reward from it, so the league can stall without either side "winning".
+- **Throughput:** if the optimizations deliver less than estimated, S1 takes ~27 h; M6 acceptance does not require passing `G(S1)`.
+
+#### 4.8.11 Decisions
+
+Accepted by the user on 2026-11-27: the recommended option of each row below (D1 a, D2 a, D3 a, D4 a with b as an ablation, D5 a after M6.0, D6 a, D7 a, D8 a, D9 a).
+
+| # | Decision | Options | Recommendation |
+|---|---|---|---|
+| D1 | Starting checkpoints after layout v2 | (a) distill the four teachers through the adapter (~1 h GPU); (b) from scratch inside the league; (c) re-run the M4/M5/4.7 recipes on v2 (~8 h); (d) first resume `zombie-s0small-crowd-ft1` to 100 M on v1 (+4 h), then (a) | (a) |
+| D2 | Absolute position in the actors | (a) keep `x, y` (`/500`) in the layout but exclude them from the actor input; (b) feed them to the actor; (c) remove them from the layout (bots read the state instead) | (a) |
+| D3 | S0 for M6 | (a) zombie counts 4/6/8 and the relative gate of 4.8.1; (b) original 2-4 with the relative gate; (c) original 4.4 gate (> 60% caught) | (a) |
+| D4 | PFSP weighting and scripted share | (a) `(1 - p)^2` + 10% uniform, scripted pinned at 20% of B/C episodes; (b) `p (1 - p)` as in 4.3 | (a), with (b) as an ablation |
+| D5 | Throughput work before S1 | (a) optimizations 1-4 of 4.8.3 (~2-3 days of development; S1 ~13 h instead of ~27 h); (b) only what M6.0 shows is cheap, accepting ~5 k env steps/s on S1 | (a), after M6.0 confirms where the time goes |
+| D6 | Exploitability probe cadence | (a) at every gate check and every 200 M steps, 10 M steps per side; (b) only at gates; (c) every 100 M steps | (a) |
+| D7 | Arena placement | (a) second process in the trainer container, same GPU, 3 sim threads; (b) separate CPU-only `arena` container (section 6) | (a) for M6; (b) once the gRPC path lands in M7 |
+| D8 | S1 definition | (a) 300 m, 6 houses, 45 food, 75 m spawn, 10 min, counts 8/12/16; (b) section 4.4 as written (30 food, 4-8 zombies) | (a) |
+| D9 | v1 ONNX models in `data/models/` | (a) move to `data/models/legacy/` (not listed); (b) delete; (c) keep (the server rejects them on `obs_dim` and logs it) | (a) |
 
 ---
 
@@ -566,6 +809,6 @@ Each milestone ends with something runnable through `docker compose` / `make` an
 | **M3 Server + top-down viewer** | `zai-server` match manager, viewer WebSocket, replay storage, metrics API; `web` top-down view | Scripted-bot match visible live in the browser at x1-x16; replay playback; metrics endpoint accepts and serves test data. |
 | **M4 Human training** | `zai_rl` recurrent PPO for the human vs scripted zombies (S0), trainer image with GPU override, TensorBoard + metrics push | Human survival beats the scripted human baseline on S0; curves visible in the viewer. |
 | **M5 Zombie training** | MAPPO with shared params and centralized critic vs scripted human (S0) | Zombie catch rate beats the scripted zombie baseline on S0. |
-| **M6 Co-training + arena** | Env groups A/B/C, snapshot pool with PFSP, arena with Elo, cross-play and tactic metrics, curriculum gates | Both sides improve in Elo against fixed anchors on S0-S1; tactic metric panels in the viewer. |
+| **M6 Co-training + arena** (plan in section 4.8) | M6.0 throughput profiling; M6.1 observation layout v2 (constant normalization) with distilled starting checkpoints; M6.2 Rust episode tactic counters; M6.3 `MatchTrainingEnv` with env groups A/B/C in one league trainer, snapshot pool with PFSP and imbalance guard; M6.4 arena with cross-play Elo, anchors, exploitability probe and the viewer league panel; M6.5 curriculum gates `s0_small` -> S0 -> S1 | League passes the `s0_small` and S0 gates and advances automatically; on S1 both sides gain >= +100 Elo over their S1 starters against fixed anchors, without cycling (section 4.8.8); Elo, cross-play, gate and tactic metric panels in the viewer. |
 | **M7 gRPC agents + 3D view** | `agent.proto`, `zai_agent` client, server agent API, Three.js first-person view | Arena drives a live server match with two checkpoints over gRPC; obs parity with training verified by a hash test; 3D view follows the human. |
 | **M8 Full spec runs** | S2 training at PRD values, long runs, ablations (zombie communication, noise sigma, respawn) | Report on emergent tactics using section 4.5 metrics vs baselines. |
