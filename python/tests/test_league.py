@@ -25,10 +25,10 @@ def tiny_cfg():
 def test_groups_split_kinds_and_counts():
     groups = league_groups(16, [2, 3], (0.5, 0.25, 0.25))
     assert [(g.kind, g.zombie_count, g.num_envs) for g in groups] == [
-        ("A", 2, 4),
-        ("A", 3, 4),
         ("B", 2, 2),
         ("B", 3, 2),
+        ("A", 2, 4),
+        ("A", 3, 4),
         ("C", 2, 2),
         ("C", 3, 2),
     ]
@@ -44,6 +44,14 @@ def test_match_env_rows_round_trip(tiny_cfg):
         env.zombie_envs[env.zombie_agent_env], env.agent_env[env.zombie_agents]
     )
     assert set(env.kind[env.agent_env[env.opp_zombie_agents]]) == {"B"}
+    # Learner rows are contiguous, so they are selected by slicing.
+    for sel, rows in (
+        (env.human_sel, env.human_rows),
+        (env.zombie_env_sel, env.zombie_envs),
+        (env.zombie_agent_sel, env.zombie_agents),
+    ):
+        assert isinstance(sel, slice)
+        np.testing.assert_array_equal(np.arange(env.num_agents)[sel], rows)
     obs = env.reset()
     step = env.step(np.zeros((16, 2), dtype=np.int64), np.full(env.num_agents, 16))
     hv, zv = env.human_view(step), env.zombie_view(step)

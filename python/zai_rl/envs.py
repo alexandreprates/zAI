@@ -241,11 +241,15 @@ class GroupSpec:
 def league_groups(
     num_envs: int, zombie_counts: list[int], shares: tuple[float, float, float]
 ) -> list[GroupSpec]:
-    """Groups A/B/C with `shares` of `num_envs`, each split equally across `zombie_counts`."""
+    """Groups A/B/C with `shares` of `num_envs`, each split equally across `zombie_counts`.
+
+    The groups are ordered B, A, C, so the human learner's envs (A and B) and the zombie
+    learner's envs (A and C) are both contiguous and `MatchTrainingEnv` selects them by slicing.
+    """
     per_kind = [int(round(num_envs * s)) for s in shares]
     per_kind[0] = num_envs - per_kind[1] - per_kind[2]
     groups = []
-    for kind, n in zip("ABC", per_kind, strict=True):
+    for kind, n in sorted(zip("ABC", per_kind, strict=True), key=lambda kn: "BAC".index(kn[0])):
         if n == 0:
             continue
         for count, size in zip(zombie_counts, group_sizes(n, len(zombie_counts)), strict=True):
@@ -322,9 +326,18 @@ class MatchTrainingEnv:
         # Opponent rows: frozen humans in C, frozen zombies in B.
         self.opp_human_rows = np.nonzero(self.kind == "C")[0]
         self.opp_zombie_agents = np.nonzero(self.kind[self.agent_env] == "B")[0]
+        # The same learner rows as slices when contiguous (groups ordered B, A, C), so that
+        # selecting them gives views instead of copies.
+        self.human_sel = _selector(self.human_rows)
+        self.zombie_env_sel = _selector(self.zombie_envs)
+        self.zombie_agent_sel = _selector(self.zombie_agents)
 
     def _cat(self, parts: list[Any], f) -> np.ndarray:
         return np.concatenate([f(p) for p in parts])
+
+    def _cat_if(self, parts: list[Any], f, rows: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+        """`_cat`, or `fallback` when no part has a valid row (`rows`: per-env flags)."""
+        return self._cat(parts, f) if rows.any() else fallback
 
     def _obs(self, parts: list[Any]) -> MatchObs:
         return MatchObs(
@@ -347,21 +360,33 @@ class MatchTrainingEnv:
         def flat(x: np.ndarray) -> np.ndarray:
             return x.reshape(-1, *x.shape[2:])
 
+        nxt = self._obs([p.obs for p in parts])
+        terminated = self._cat(parts, lambda p: p.terminated)
+        truncated = self._cat(parts, lambda p: p.truncated)
+        # The final_* rows are only read where an episode truncated (ended), which most steps
+        # have none of: skip those copies then (the next observation stands in).
         return MatchStep(
-            next=self._obs([p.obs for p in parts]),
+            next=nxt,
             human_reward=self._cat(parts, lambda p: p.human_reward),
             zombie_reward=self._cat(parts, lambda p: p.zombie_reward.reshape(-1)),
-            terminated=self._cat(parts, lambda p: p.terminated),
-            truncated=self._cat(parts, lambda p: p.truncated),
+            terminated=terminated,
+            truncated=truncated,
             outcome=self._cat(parts, lambda p: p.outcome),
             episode_length=self._cat(parts, lambda p: p.episode_length),
-            final_zombie_obs=self._cat(parts, lambda p: flat(p.final_zombie_obs)),
-            final_state=self._cat(parts, lambda p: p.final_state),
-            final_stats=self._cat(parts, lambda p: p.final_stats),
+            final_zombie_obs=self._cat_if(
+                parts, lambda p: flat(p.final_zombie_obs), truncated, nxt.zombie_obs
+            ),
+            final_state=self._cat_if(parts, lambda p: p.final_state, truncated, nxt.state),
+            final_stats=self._cat_if(
+                parts,
+                lambda p: p.final_stats,
+                terminated | truncated,
+                np.zeros((self.num_envs, parts[0].final_stats.shape[1]), np.float32),
+            ),
         )
 
     def human_view(self, step: MatchStep) -> HumanStep:
-        r = self.human_rows
+        r = self.human_sel
         return HumanStep(
             next=HumanBatch(step.next.human_obs[r], step.next.human_mask[r], step.next.state[r]),
             reward=step.human_reward[r],
@@ -373,7 +398,7 @@ class MatchTrainingEnv:
         )
 
     def zombie_view(self, step: MatchStep) -> ZombieStep:
-        e, a = self.zombie_envs, self.zombie_agents
+        e, a = self.zombie_env_sel, self.zombie_agent_sel
         return ZombieStep(
             next=ZombieBatch(step.next.zombie_obs[a], step.next.state[e]),
             reward=step.zombie_reward[a],
@@ -384,3 +409,10 @@ class MatchTrainingEnv:
             final_obs=step.final_zombie_obs[a],
             final_state=step.final_state[e],
         )
+
+
+def _selector(idx: np.ndarray) -> slice | np.ndarray:
+    """`idx` as a slice when it is a contiguous ascending range, else unchanged."""
+    if len(idx) and idx[-1] - idx[0] + 1 == len(idx) and np.all(np.diff(idx) == 1):
+        return slice(int(idx[0]), int(idx[-1]) + 1)
+    return idx

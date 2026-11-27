@@ -27,6 +27,12 @@ league:
   lease_iters: 5
   snapshot_every_steps: 10000000
   pfsp: hard
+  # Engage the imbalance guard earlier than the defaults (short run league-s0small-short1:
+  # s_z fell to 0.15 without the guard engaging).
+  guard_low: 0.3
+  guard_high: 0.7
+  guard_windows: 2
+  guard_release: [0.35, 0.65]
 human:
   rollout: 128
   bptt: 64
@@ -39,9 +45,9 @@ human:
 zombie:
   rollout: 128
   bptt: 64
-  epochs: 3
+  epochs: 4
   minibatches: 8
-  lr: 0.00015
+  lr: 0.0003  # 1.5e-4 barely moved the zombies in league-s0small-short1 (approx_kl ~0.001)
   ent_start: 0.005
   ent_end: 0.001
   hidden: 128

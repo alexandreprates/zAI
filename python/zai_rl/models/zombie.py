@@ -94,14 +94,14 @@ class ZombieActor(nn.Module):
     def step(self, obs: torch.Tensor, h: torch.Tensor) -> tuple[Categorical, torch.Tensor]:
         """One decision for `B` zombies: returns (movement dist, new hidden state)."""
         out, hn = self.gru(self.encode(obs).unsqueeze(1), h.unsqueeze(0).contiguous())
-        return Categorical(logits=self.move_head(out[:, 0])), hn[0]
+        return Categorical(logits=self.move_head(out[:, 0]), validate_args=False), hn[0]
 
     def sequence(self, obs: torch.Tensor, h0: torch.Tensor, starts: torch.Tensor) -> Categorical:
         """Distributions for whole sequences `[B, L, ...]` (training), flattened to `B * L`."""
         B, L, _ = obs.shape
         x = self.encode(obs.reshape(B * L, -1)).reshape(B, L, -1)
         out = run_gru_segments(self.gru, x, h0, starts).reshape(B * L, -1)
-        return Categorical(logits=self.move_head(out))
+        return Categorical(logits=self.move_head(out), validate_args=False)
 
 
 class ZombieCritic(nn.Module):

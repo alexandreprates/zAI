@@ -111,6 +111,9 @@ class LeagueConfig:
     num_threads: int | None = None
     torch_threads: int | None = None
     device: str = "auto"
+    # On CUDA, replay the learners' and resident opponents' decision steps as CUDA graphs
+    # (zai_rl.models.graphs): the rollout is bound by kernel launches otherwise.
+    cuda_graphs: bool = True
     human_init: str | None = None  # layout v2 checkpoints the learners start from
     zombie_init: str | None = None
     seeds: list[Seed] = field(default_factory=list)  # extra pool entries
@@ -678,6 +681,7 @@ class League:
             p.scripted_share,
             p.lease_iters,
             cfg.seed + 101,
+            graph=cfg.cuda_graphs,
         )
         opp_h = OpponentSlots(
             "human",
@@ -689,6 +693,7 @@ class League:
             p.scripted_share,
             p.lease_iters,
             cfg.seed + 202,
+            graph=cfg.cuda_graphs,
         )
         eh, az = len(env.human_rows), len(env.zombie_agents)
         hro = HumanRollout(
@@ -696,6 +701,7 @@ class League:
             self.human.actor.initial_state(eh, dev),
             torch.ones(eh, dtype=torch.bool, device=dev),
             np.zeros(eh),
+            graph=cfg.cuda_graphs,
         )
         zro = ZombieRollout(
             self.zombie,
@@ -703,6 +709,7 @@ class League:
             self.zombie.actor.initial_state(az, dev),
             torch.ones(az, dtype=torch.bool, device=dev),
             np.zeros(az),
+            graph=cfg.cuda_graphs,
         )
         obs = env.reset()
         per_iter = cfg.human.rollout * env.num_envs
@@ -739,17 +746,22 @@ class League:
             for _ in range(cfg.human.rollout):
                 ha = np.zeros((env.num_envs, 2), dtype=np.int64)
                 za = np.zeros(env.num_agents, dtype=np.int64)
-                ha[env.human_rows] = hro.act(
-                    obs.human_obs[env.human_rows],
-                    obs.human_mask[env.human_rows],
-                    obs.state[env.human_rows],
+                # Both learners' forward passes are queued first; the opponents' transfer
+                # then waits for them too, so the learners' own transfers below are cheap.
+                ha_t = hro.act_device(
+                    obs.human_obs[env.human_sel],
+                    obs.human_mask[env.human_sel],
+                    obs.state[env.human_sel],
                 )
-                za[env.zombie_agents] = zro.act(
-                    obs.zombie_obs[env.zombie_agents], obs.state[env.zombie_envs]
+                za_t = zro.act_device(
+                    obs.zombie_obs[env.zombie_agent_sel], obs.state[env.zombie_env_sel]
                 )
                 with timer("opponent"):
                     ha[opp_h.rows] = opp_h.act(obs)
                     za[opp_z.rows] = opp_z.act(obs)
+                with timer("policy"):
+                    ha[env.human_sel] = ha_t.cpu().numpy()
+                    za[env.zombie_agent_sel] = za_t.cpu().numpy()
                 step = env.step(ha, za)
                 hro.record(env.human_view(step), hstats)
                 zro.record(env.zombie_view(step), zstats)
@@ -767,8 +779,8 @@ class League:
                     )
                 obs = step.next
             t1 = time.time()
-            hr = hro.finish(obs.state[env.human_rows])
-            zr = zro.finish(obs.zombie_obs[env.zombie_agents], obs.state[env.zombie_envs])
+            hr = hro.finish(obs.state[env.human_sel])
+            zr = zro.finish(obs.zombie_obs[env.zombie_agent_sel], obs.state[env.zombie_env_sel])
             # Learning-rate schedules run over each stage's maximum budget.
             progress = min(1.0, in_stage / st.max_steps)
             he, hs = self.guard.overrides("human", cfg.human.epochs)

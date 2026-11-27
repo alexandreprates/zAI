@@ -102,7 +102,10 @@ class HumanActor(nn.Module):
         neg = torch.finfo(out.dtype).min
         move_logits = self.move_head(out).masked_fill(~mask[:, :MOVE], neg)
         interact_logits = self.interact_head(out).masked_fill(~mask[:, MOVE:], neg)
-        return Categorical(logits=move_logits), Categorical(logits=interact_logits)
+        return (
+            Categorical(logits=move_logits, validate_args=False),
+            Categorical(logits=interact_logits, validate_args=False),
+        )
 
     def step(
         self, obs: torch.Tensor, h: torch.Tensor, mask: torch.Tensor

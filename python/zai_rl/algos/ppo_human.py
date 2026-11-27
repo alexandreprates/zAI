@@ -16,7 +16,7 @@ import torch
 from torch import nn
 
 from ..envs import HumanBatch, HumanStep, HumanTrainingEnv
-from ..models import HumanActor, HumanCritic
+from ..models import HumanActor, HumanCritic, graphs
 from ..profiling import timer
 from .common import (
     EpisodeStats,
@@ -205,9 +205,19 @@ class HumanRollout:
     `finish(next_state)`. `h [E, H]`, `start [E]` and `ep_return [E]` carry over between
     rollouts."""
 
-    def __init__(self, algo: HumanPPO, h: torch.Tensor, start: torch.Tensor, ep_return: np.ndarray):
+    def __init__(
+        self,
+        algo: HumanPPO,
+        h: torch.Tensor,
+        start: torch.Tensor,
+        ep_return: np.ndarray,
+        graph: bool = False,
+    ):
+        """`graph`: replay the actor's step as a CUDA graph (`models.graphs`) on CUDA."""
         self.algo = algo
         self.h, self.start, self.ep_return = h, start, ep_return
+        self.graph = graph and graphs.usable(algo.device)
+        self._graphed: graphs.GraphedActor | None = None
 
     def begin(self) -> None:
         self.t = 0
@@ -229,6 +239,13 @@ class HumanRollout:
 
     @torch.no_grad()
     def act(self, obs: np.ndarray, mask: np.ndarray, state: np.ndarray) -> np.ndarray:
+        actions = self.act_device(obs, mask, state)
+        with timer("policy"):
+            return actions.cpu().numpy()
+
+    @torch.no_grad()
+    def act_device(self, obs: np.ndarray, mask: np.ndarray, state: np.ndarray) -> torch.Tensor:
+        """`act` without the transfer: the actions `[E, 2]` stay on the device."""
         algo = self.algo
         with timer("policy"):
             obs_t = algo._t(obs)
@@ -237,14 +254,20 @@ class HumanRollout:
             self.h = self.h * (~self.start).unsqueeze(1)
             if self.t % algo.cfg.bptt == 0:
                 self.h0.append(self.h.clone())
-            move, interact, self.h_new = algo.actor.step(obs_t, self.h, mask_t)
+            if self.graph:
+                if self._graphed is None:
+                    self._graphed = graphs.GraphedActor(algo.actor, obs_t, self.h, mask_t)
+                move_l, inter_l, hn = self._graphed.run(obs_t, self.h, mask_t)
+                move, interact = graphs.dist(move_l), graphs.dist(inter_l)
+                self.h_new = hn.clone()
+            else:
+                move, interact, self.h_new = algo.actor.step(obs_t, self.h, mask_t)
             a_move, a_inter = move.sample(), interact.sample()
             logp = move.log_prob(a_move) + interact.log_prob(a_inter)
             value = algo.value(state_t)
             actions = torch.stack([a_move, a_inter], dim=1)
-            actions_np = actions.cpu().numpy()
         self.pending = (obs_t, mask_t, state_t, actions, logp, value)
-        return actions_np
+        return actions
 
     @torch.no_grad()
     def record(self, step: HumanStep, stats: EpisodeStats) -> None:

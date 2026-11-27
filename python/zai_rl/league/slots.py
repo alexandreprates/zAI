@@ -18,6 +18,7 @@ import torch
 
 from ..bots import ScriptedHuman, ScriptedZombies
 from ..envs import MatchObs, MatchTrainingEnv
+from ..models import graphs
 from ..policy import load_human_actor, load_zombie_actor
 from .pool import Entry, Pool, other
 
@@ -43,7 +44,13 @@ class OpponentSlots:
         scripted_share: float = 0.2,
         lease_iters: int = 5,
         seed: int = 0,
+        graph: bool = True,
     ):
+        """`graph`: on CUDA, each resident actor runs as a CUDA graph (`models.graphs`) over all
+        of this side's rows, and its own rows are picked from the result."""
+        self.graph = graph and graphs.usable(device)
+        self.templates: dict[int, _Template] = {}
+        self.graphs: dict[tuple[int, int], graphs.GraphedActor] = {}  # (slot, batch) -> graph
         self.side, self.learner = side, other(side)
         self.env, self.pool, self.device, self.rng = env, pool, device, rng
         self.scripted_share, self.lease_iters = scripted_share, lease_iters
@@ -145,11 +152,39 @@ class OpponentSlots:
     # --- acting -------------------------------------------------------------------------
     @torch.no_grad()
     def act(self, obs: MatchObs) -> np.ndarray:
-        """Actions of every opponent row: `[envs, 2]` for humans, `[agents]` for zombies."""
+        """Actions of every opponent row: `[envs, 2]` for humans, `[agents]` for zombies.
+
+        The resident actors' forward passes are queued on the device first and their actions
+        come back in one transfer after the scripted bots ran on the CPU, so the two overlap.
+        """
         env = self.env
         human = self.side == "human"
         out = np.zeros((len(self.rows), 2) if human else len(self.rows), dtype=np.int64)
         slot_of_row = self.env_slot[self.row_env]
+        sampled: list[tuple[np.ndarray, torch.Tensor]] = []
+        for k, s in enumerate(self.slots):
+            if k == 0 or s.actor is None:
+                continue
+            sel = np.nonzero(slot_of_row == k)[0]
+            if len(sel) == 0:
+                continue
+            sel_t = torch.as_tensor(sel, device=self.device)
+            if self.graph:
+                sampled.append((sel, self._act_graphed(k, s.actor, obs, sel, sel_t)))
+                continue
+            rows = self.rows[sel]
+            h = self.h[sel_t]
+            if human:
+                o = torch.as_tensor(obs.human_obs[rows], device=self.device)
+                m = torch.as_tensor(obs.human_mask[rows], device=self.device)
+                move, inter, h = s.actor.step(o, h, m)
+                a = torch.stack([move.sample(), inter.sample()], 1)
+            else:
+                o = torch.as_tensor(obs.zombie_obs[rows], device=self.device)
+                dist, h = s.actor.step(o, h)
+                a = dist.sample()
+            self.h[sel_t] = h
+            sampled.append((sel, a))
         # Scripted bots act on their whole group; only the rows in slot 0 are used.
         for i, bot in self.bots.items():
             es, as_ = env.env_slices[i], env.agent_slices[i]
@@ -162,23 +197,62 @@ class OpponentSlots:
             pos = self.bot_pos[i]
             use = slot_of_row[pos] == 0
             out[pos[use]] = a[use]
-        for k, s in enumerate(self.slots):
-            if k == 0 or s.actor is None:
-                continue
-            sel = np.nonzero(slot_of_row == k)[0]
-            if len(sel) == 0:
-                continue
-            rows = self.rows[sel]
-            sel_t = torch.as_tensor(sel, device=self.device)
-            h = self.h[sel_t]
-            if human:
-                o = torch.as_tensor(obs.human_obs[rows], device=self.device)
-                m = torch.as_tensor(obs.human_mask[rows], device=self.device)
-                move, inter, h = s.actor.step(o, h, m)
-                out[sel] = torch.stack([move.sample(), inter.sample()], 1).cpu().numpy()
-            else:
-                o = torch.as_tensor(obs.zombie_obs[rows], device=self.device)
-                dist, h = s.actor.step(o, h)
-                out[sel] = dist.sample().cpu().numpy()
-            self.h[sel_t] = h
+        if sampled:
+            actions = torch.cat([a for _, a in sampled]).cpu().numpy()
+            out[np.concatenate([sel for sel, _ in sampled])] = actions
         return out
+
+    def _act_graphed(
+        self, k: int, actor: Any, obs: MatchObs, sel: np.ndarray, sel_t: torch.Tensor
+    ) -> torch.Tensor:
+        """Actions of slot `k`'s rows `sel` (positions among this side's rows) from a graph of
+        its actor; updates their memory. The batch is padded (repeating the first row) up to a
+        multiple of `GRAPH_BUCKET`, with one graph per slot and padded size, all reading the
+        slot's template actor, into which a new resident's weights are copied."""
+        human = self.side == "human"
+        tmpl = self.templates.get(k)
+        if tmpl is None or tmpl.src is not actor:
+            if tmpl is not None and _compatible(tmpl.actor, actor):
+                tmpl.actor.load_state_dict(actor.state_dict())
+                tmpl.src = actor
+            else:  # first resident of the slot, or another architecture: capture anew
+                self.templates[k] = _Template(actor, actor)
+                for key in [key for key in self.graphs if key[0] == k]:
+                    del self.graphs[key]
+            tmpl = self.templates[k]
+        n = len(sel)
+        b = min(-(-n // GRAPH_BUCKET) * GRAPH_BUCKET, len(self.rows))
+        pad = np.concatenate([sel, np.full(b - n, sel[0])])
+        rows = self.rows[pad]
+        o_np = obs.human_obs[rows] if human else obs.zombie_obs[rows]
+        o = torch.as_tensor(o_np, device=self.device)
+        m = torch.as_tensor(obs.human_mask[rows], device=self.device) if human else None
+        h = self.h[torch.as_tensor(pad, device=self.device)]
+        g = self.graphs.get((k, b))
+        if g is None:
+            g = self.graphs[(k, b)] = graphs.GraphedActor(tmpl.actor, o, h, m)
+        out = g.run(o, h, m)
+        self.h[sel_t] = out[-1][:n]
+        if human:
+            move, inter = graphs.dist(out[0][:n]), graphs.dist(out[1][:n])
+            return torch.stack([move.sample(), inter.sample()], 1)
+        return graphs.dist(out[0][:n]).sample()
+
+
+GRAPH_BUCKET = 128  # rows; graph batch sizes are multiples of this
+
+
+@dataclass
+class _Template:
+    actor: Any  # the module the slot's graphs captured
+    src: Any  # the resident actor whose weights it holds
+
+
+def _compatible(a: Any, b: Any) -> bool:
+    sa, sb = a.state_dict(), b.state_dict()
+    return (
+        type(a) is type(b)
+        and getattr(a, "obs_version", None) == getattr(b, "obs_version", None)
+        and sa.keys() == sb.keys()
+        and all(sa[key].shape == sb[key].shape for key in sa)
+    )

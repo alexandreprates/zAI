@@ -20,9 +20,11 @@ from torch import nn
 from zai_env.layout import FAR_M, STATE
 
 from ..envs import ZombieBatch, ZombieStep, ZombieTrainingEnv
-from ..models import ZombieActor, ZombieCritic
+from ..models import ZombieActor, ZombieCritic, graphs
 from ..profiling import timer
 from .common import EpisodeStats, RunningMeanStd, bptt_sequences, gae, require_obs_version
+
+NEAREST_EVERY = 8  # decisions between samples of the train/nearest_zombie_m metric
 
 
 def nearest_zombie_m(state: np.ndarray) -> np.ndarray:
@@ -216,11 +218,15 @@ class ZombieRollout:
         h: torch.Tensor,
         start: torch.Tensor,
         ep_return: np.ndarray,
+        graph: bool = False,
     ):
+        """`graph`: replay the actor's step as a CUDA graph (`models.graphs`) on CUDA."""
         self.algo = algo
         self.agent_env_np = agent_env
         self.agent_env = algo._t(agent_env, torch.long)
         self.h, self.start, self.ep_return = h, start, ep_return
+        self.graph = graph and graphs.usable(algo.device)
+        self._graphed: graphs.GraphedActor | None = None
 
     def begin(self) -> None:
         self.t = 0
@@ -233,21 +239,35 @@ class ZombieRollout:
 
     @torch.no_grad()
     def act(self, obs: np.ndarray, state: np.ndarray) -> np.ndarray:
+        actions = self.act_device(obs, state)
+        with timer("policy"):
+            return actions.cpu().numpy()
+
+    @torch.no_grad()
+    def act_device(self, obs: np.ndarray, state: np.ndarray) -> torch.Tensor:
+        """`act` without the transfer: the actions stay on the device (no synchronization), so
+        a caller can queue more work before fetching them."""
         algo = self.algo
-        self.nearest.append(float(nearest_zombie_m(state).mean()))
+        if self.t % NEAREST_EVERY == 0:
+            self.nearest.append(float(nearest_zombie_m(state).mean()))
         with timer("policy"):
             obs_t = algo._t(obs)
             state_t = algo._t(state)
             self.h = self.h * (~self.start).unsqueeze(1)
             if self.t % algo.cfg.bptt == 0:
                 self.h0.append(self.h.clone())
-            dist, self.h_new = algo.actor.step(obs_t, self.h)
+            if self.graph:
+                if self._graphed is None:
+                    self._graphed = graphs.GraphedActor(algo.actor, obs_t, self.h)
+                logits, hn = self._graphed.run(obs_t, self.h)
+                dist, self.h_new = graphs.dist(logits), hn.clone()
+            else:
+                dist, self.h_new = algo.actor.step(obs_t, self.h)
             actions = dist.sample()
             logp = dist.log_prob(actions)
             value = algo.value(state_t[self.agent_env], obs_t)
-            actions_np = actions.cpu().numpy()
         self.pending = (obs_t, state_t, actions, logp, value)
-        return actions_np
+        return actions
 
     @torch.no_grad()
     def record(self, step: ZombieStep, stats: EpisodeStats) -> None:
