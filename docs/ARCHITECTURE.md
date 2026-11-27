@@ -491,6 +491,8 @@ M6 in total (three stages) is about 42 h at the current throughput and about 22 
 
 #### 4.8.4 `MatchTrainingEnv` and the league trainer
 
+**Status (2026-11-27): implemented** in `zai_rl/train_league.py` (`League`, `LeagueConfig`, `Guard`), `zai_rl/league/pool.py`, `zai_rl/league/slots.py` and `envs.MatchTrainingEnv` / `league_groups`, configs `configs/train/league_cpu.yaml` and `league_s0small_gpu.yaml`, `make train-league{,-gpu}`. Differences from the text below: `HumanTrainingEnv` / `ZombieTrainingEnv` stay as they are (no wrappers); the learners' `collect` was split into `HumanRollout` / `ZombieRollout` (`begin/act/record/finish`, bit-identical rollouts) and the league drives both through them; curriculum gates and stage advance (M6.5) are not in yet, and the trainer runs a light anchor evaluation against the scripted bots (`anchor/*`, every `eval_every` iterations) until the arena takes over.
+
 **Environment.** `envs.MatchTrainingEnv(config, groups, pool_sides, seed, num_threads)` with `groups` a list of `GroupSpec(kind in {A, B, C}, zombie_count, num_envs)`. Defaults: A 50%, B 25%, C 25% of `num_envs`, each split equally across the stage's zombie counts (`group_sizes`), so 9 groups. Env axis `[E]` ordered by kind, then count. Static index arrays built once:
 - `human_env [E_h]`: envs of A and B (human learner rows); `zombie_env [E_z]`: envs of A and C; `agent_env [A_z]`: for each learner zombie, its row in `zombie_env` (zombie `n` of env `e`, as in M5), so the MAPPO buffers stay `[T, A_z, ...]` with state stored per env `[T, E_z, 1144]`.
 - Opponent rows: zombies of group B envs (`[A_B]`) and humans of group C envs (`[E_C]`), each with a per-env `slot [E]` index (below).

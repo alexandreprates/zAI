@@ -225,3 +225,162 @@ class ZombieTrainingEnv:
             final_obs=cat(lambda p: flat(p.final_zombie_obs)),
             final_state=cat(lambda p: p.final_state),
         )
+
+
+@dataclass(frozen=True)
+class GroupSpec:
+    """One group of the league (docs/ARCHITECTURE.md section 4.8.4): in kind A both learners
+    play, in B the human learner plays frozen zombies, in C the zombie learner plays a frozen
+    human."""
+
+    kind: str  # A | B | C
+    zombie_count: int
+    num_envs: int
+
+
+def league_groups(
+    num_envs: int, zombie_counts: list[int], shares: tuple[float, float, float]
+) -> list[GroupSpec]:
+    """Groups A/B/C with `shares` of `num_envs`, each split equally across `zombie_counts`."""
+    per_kind = [int(round(num_envs * s)) for s in shares]
+    per_kind[0] = num_envs - per_kind[1] - per_kind[2]
+    groups = []
+    for kind, n in zip("ABC", per_kind, strict=True):
+        if n == 0:
+            continue
+        for count, size in zip(zombie_counts, group_sizes(n, len(zombie_counts)), strict=True):
+            groups.append(GroupSpec(kind, count, size))
+    return groups
+
+
+@dataclass
+class MatchObs:
+    human_obs: np.ndarray  # [E, HUMAN_OBS_DIM]
+    human_mask: np.ndarray  # [E, 20] bool
+    state: np.ndarray  # [E, STATE_DIM]
+    zombie_obs: np.ndarray  # [A, ZOMBIE_OBS_DIM], every zombie of every env
+
+
+@dataclass
+class MatchStep:
+    next: MatchObs
+    human_reward: np.ndarray  # [E]
+    zombie_reward: np.ndarray  # [A]
+    terminated: np.ndarray  # [E] bool
+    truncated: np.ndarray  # [E] bool
+    outcome: np.ndarray  # [E] uint8
+    episode_length: np.ndarray  # [E]
+    final_zombie_obs: np.ndarray  # [A], rows valid where the agent's env truncated
+    final_state: np.ndarray  # [E], rows valid where truncated
+    final_stats: np.ndarray  # [E, STATS_DIM], rows valid where the episode ended
+
+
+class MatchTrainingEnv:
+    """All league groups as one batch, with both sides' actions supplied by the caller.
+
+    Envs `[E]` are ordered by group; every zombie of every env sits on a flat axis `[A]` with
+    `agent_env [A]` (env of each agent). `kind [E]` is the group kind of each env. Learner and
+    opponent rows are selected with the index arrays below; `human_view` / `zombie_view` build
+    the `HumanStep` / `ZombieStep` the learners' rollouts record.
+    """
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        groups: list[GroupSpec],
+        seed: int = 0,
+        num_threads: int | None = None,
+    ):
+        self.specs = groups
+        self.venvs: list[ZaiVecEnv] = []
+        self.group_cfgs: list[dict[str, Any]] = []
+        kind, agent_env, env_slices, agent_slices = [], [], [], []
+        e0 = a0 = 0
+        for i, g in enumerate(groups):
+            cfg = deep_merge(config, {"zombie_count": g.zombie_count})
+            self.group_cfgs.append(cfg)
+            self.venvs.append(
+                ZaiVecEnv(cfg, num_envs=g.num_envs, seed=seed + 1000 * i, num_threads=num_threads)
+            )
+            kind += [g.kind] * g.num_envs
+            agent_env.append(np.repeat(np.arange(g.num_envs) + e0, g.zombie_count))
+            env_slices.append(slice(e0, e0 + g.num_envs))
+            agent_slices.append(slice(a0, a0 + g.num_envs * g.zombie_count))
+            e0 += g.num_envs
+            a0 += g.num_envs * g.zombie_count
+        self.num_envs, self.num_agents = e0, a0
+        self.kind = np.array(kind)
+        self.agent_env = np.concatenate(agent_env)
+        self.env_slices, self.agent_slices = env_slices, agent_slices
+        # Learner rows.
+        self.human_rows = np.nonzero(np.isin(self.kind, ["A", "B"]))[0]
+        self.zombie_envs = np.nonzero(np.isin(self.kind, ["A", "C"]))[0]
+        self.zombie_agents = np.nonzero(np.isin(self.kind[self.agent_env], ["A", "C"]))[0]
+        local = np.full(self.num_envs, -1)
+        local[self.zombie_envs] = np.arange(len(self.zombie_envs))
+        self.zombie_agent_env = local[self.agent_env[self.zombie_agents]]  # into zombie_envs
+        # Opponent rows: frozen humans in C, frozen zombies in B.
+        self.opp_human_rows = np.nonzero(self.kind == "C")[0]
+        self.opp_zombie_agents = np.nonzero(self.kind[self.agent_env] == "B")[0]
+
+    def _cat(self, parts: list[Any], f) -> np.ndarray:
+        return np.concatenate([f(p) for p in parts])
+
+    def _obs(self, parts: list[Any]) -> MatchObs:
+        return MatchObs(
+            human_obs=self._cat(parts, lambda o: o.human_obs),
+            human_mask=self._cat(parts, lambda o: o.human_mask),
+            state=self._cat(parts, lambda o: o.state),
+            zombie_obs=self._cat(parts, lambda o: o.zombie_obs.reshape(-1, o.zombie_obs.shape[-1])),
+        )
+
+    def reset(self) -> MatchObs:
+        return self._obs([v.reset() for v in self.venvs])
+
+    def step(self, human_actions: np.ndarray, zombie_actions: np.ndarray) -> MatchStep:
+        parts = []
+        with timer("sim"):
+            for v, es, as_ in zip(self.venvs, self.env_slices, self.agent_slices, strict=True):
+                za = zombie_actions[as_].reshape(v.num_envs, v.num_zombies)
+                parts.append(v.step(human_actions[es], za))
+
+        def flat(x: np.ndarray) -> np.ndarray:
+            return x.reshape(-1, *x.shape[2:])
+
+        return MatchStep(
+            next=self._obs([p.obs for p in parts]),
+            human_reward=self._cat(parts, lambda p: p.human_reward),
+            zombie_reward=self._cat(parts, lambda p: p.zombie_reward.reshape(-1)),
+            terminated=self._cat(parts, lambda p: p.terminated),
+            truncated=self._cat(parts, lambda p: p.truncated),
+            outcome=self._cat(parts, lambda p: p.outcome),
+            episode_length=self._cat(parts, lambda p: p.episode_length),
+            final_zombie_obs=self._cat(parts, lambda p: flat(p.final_zombie_obs)),
+            final_state=self._cat(parts, lambda p: p.final_state),
+            final_stats=self._cat(parts, lambda p: p.final_stats),
+        )
+
+    def human_view(self, step: MatchStep) -> HumanStep:
+        r = self.human_rows
+        return HumanStep(
+            next=HumanBatch(step.next.human_obs[r], step.next.human_mask[r], step.next.state[r]),
+            reward=step.human_reward[r],
+            terminated=step.terminated[r],
+            truncated=step.truncated[r],
+            outcome=step.outcome[r],
+            episode_length=step.episode_length[r],
+            final_state=step.final_state[r],
+        )
+
+    def zombie_view(self, step: MatchStep) -> ZombieStep:
+        e, a = self.zombie_envs, self.zombie_agents
+        return ZombieStep(
+            next=ZombieBatch(step.next.zombie_obs[a], step.next.state[e]),
+            reward=step.zombie_reward[a],
+            terminated=step.terminated[e],
+            truncated=step.truncated[e],
+            outcome=step.outcome[e],
+            episode_length=step.episode_length[e],
+            final_obs=step.final_zombie_obs[a],
+            final_state=step.final_state[e],
+        )

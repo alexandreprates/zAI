@@ -101,12 +101,19 @@ class HumanPPO:
         return ro.finish(batch.state), batch, ro.h, ro.start
 
     # --- update -------------------------------------------------------------------------
-    def update(self, rollout: dict[str, torch.Tensor], progress: float) -> dict[str, float]:
+    def update(
+        self,
+        rollout: dict[str, torch.Tensor],
+        progress: float,
+        epochs: int | None = None,
+        lr_scale: float = 1.0,
+    ) -> dict[str, float]:
+        """PPO update; `epochs` and `lr_scale` override the config (league imbalance guard)."""
         cfg = self.cfg
         T, E = rollout["rewards"].shape
         L = cfg.bptt
         chunks = T // L
-        lr = cfg.lr * max(0.0, 1.0 - progress)
+        lr = cfg.lr * max(0.0, 1.0 - progress) * lr_scale
         for g in self.optimizer.param_groups:
             g["lr"] = lr
         ent_coef = cfg.ent_start + (cfg.ent_end - cfg.ent_start) * min(1.0, progress)
@@ -121,7 +128,7 @@ class HumanPPO:
         stats: dict[str, list[float]] = {
             k: [] for k in ("policy_loss", "value_loss", "entropy", "approx_kl", "clipfrac")
         }
-        for _ in range(cfg.epochs):
+        for _ in range(cfg.epochs if epochs is None else epochs):
             perm = torch.randperm(n, device=self.device)
             for i in range(cfg.minibatches):
                 idx = perm[i * mb_size : (i + 1) * mb_size]

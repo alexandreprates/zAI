@@ -1,0 +1,47 @@
+# M6 league on the GPU server, stage s0_small (docs/ARCHITECTURE.md sections 4.8.1 and 4.8.4).
+# Learners start from the distilled layout v2 starters (configs/train/distill/); the other two
+# distilled teachers seed the pool. Fine-tune learning rates and entropy (4.7), so the start
+# does not wash out the starters. Stage budget 100-300 M env steps; the short go/no-go run of
+# 4.8.9 step 6 is this config with --total-steps 40000000.
+env_config: configs/env/s0_small.yaml
+stage: s0_small
+zombie_counts: [3, 6, 9]
+num_envs: 1024
+total_steps: 300000000
+seed: 0
+num_threads: 20
+torch_threads: 4
+device: cuda
+human_init: /checkpoints/human/human-s0small-distill/final.pt
+zombie_init: /checkpoints/zombie/zombie-s0small-crowd-distill/final.pt
+seeds:
+  - {side: zombie, path: /checkpoints/zombie/zombie-s0small-m5-distill/final.pt, id: zombie-m5}
+  - {side: human, path: /checkpoints/human/human-s0-m4-distill/final.pt, id: human-m4}
+eval_every: 20
+eval_episodes: 128
+checkpoint_every: 20
+league:
+  shares: [0.5, 0.25, 0.25]
+  slots: 4
+  scripted_share: 0.2
+  lease_iters: 5
+  snapshot_every_steps: 10000000
+  pfsp: hard
+human:
+  rollout: 128
+  bptt: 64
+  epochs: 4
+  minibatches: 8
+  lr: 0.0001
+  ent_start: 0.005
+  ent_end: 0.001
+  hidden: 256
+zombie:
+  rollout: 128
+  bptt: 64
+  epochs: 3
+  minibatches: 8
+  lr: 0.00015
+  ent_start: 0.005
+  ent_end: 0.001
+  hidden: 128

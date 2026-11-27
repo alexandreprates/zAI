@@ -9,7 +9,7 @@ unexport DOCKER_DEFAULT_PLATFORM
 DEV := docker compose run --rm -T dev
 GPU := docker compose -f compose.yaml -f compose.gpu.yaml
 
-.PHONY: test lint fmt shell build up distill-gpu export-model export-model-gpu train-human train-human-gpu tensorboard web-install web-dev check-gpu ci-test ci-lint ci-fmt ci-py-develop ci-web-install
+.PHONY: test lint fmt shell build up train-league train-league-gpu distill-gpu export-model export-model-gpu train-human train-human-gpu tensorboard web-install web-dev check-gpu ci-test ci-lint ci-fmt ci-py-develop ci-web-install
 
 test: ## Run Rust and Python tests
 	$(DEV) make ci-test
@@ -46,6 +46,12 @@ export-replays: ## Record a human checkpoint's episodes as viewer replays; ARGS=
 
 export-replays-gpu: ## On the GPU server: same as export-replays, reusing the CUDA trainer image (inference runs on CPU)
 	$(GPU) --profile train run --rm --build trainer python -m arena.export_replays $(ARGS)
+
+train-league: ## League co-training of both sides (M6) in the trainer container; ARGS="--total-steps N --run-id ID"
+	docker compose --profile train run --rm --build trainer python -m zai_rl.train_league --config /app/configs/train/league_cpu.yaml $(ARGS)
+
+train-league-gpu: ## On the GPU server: league co-training (configs/train/league_s0small_gpu.yaml)
+	$(GPU) --profile train run --rm --build trainer python -m zai_rl.train_league --config /app/configs/train/league_s0small_gpu.yaml $(ARGS)
 
 distill-gpu: ## On the GPU server: distill a checkpoint into the current observation layout; ARGS="--config /app/configs/train/distill/<name>.yaml --run-id ID"
 	$(GPU) --profile train run --rm --build trainer python -m zai_rl.distill $(ARGS)

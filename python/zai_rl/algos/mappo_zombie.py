@@ -98,13 +98,20 @@ class ZombieMAPPO:
         return ro.finish(batch.obs, batch.state), batch, ro.h, ro.start
 
     # --- update -------------------------------------------------------------------------
-    def update(self, rollout: dict[str, torch.Tensor], progress: float) -> dict[str, float]:
+    def update(
+        self,
+        rollout: dict[str, torch.Tensor],
+        progress: float,
+        epochs: int | None = None,
+        lr_scale: float = 1.0,
+    ) -> dict[str, float]:
+        """PPO update; `epochs` and `lr_scale` override the config (league imbalance guard)."""
         cfg = self.cfg
         T, A = rollout["rewards"].shape
         L = cfg.bptt
         chunks = T // L
         n = chunks * A
-        lr = cfg.lr * max(0.0, 1.0 - progress)
+        lr = cfg.lr * max(0.0, 1.0 - progress) * lr_scale
         for g in self.optimizer.param_groups:
             g["lr"] = lr
         ent_coef = cfg.ent_start + (cfg.ent_end - cfg.ent_start) * min(1.0, progress)
@@ -125,7 +132,7 @@ class ZombieMAPPO:
         stats: dict[str, list[float]] = {
             k: [] for k in ("policy_loss", "value_loss", "entropy", "approx_kl", "clipfrac")
         }
-        for _ in range(cfg.epochs):
+        for _ in range(cfg.epochs if epochs is None else epochs):
             # The agent count depends on how envs split into groups, so minibatches may
             # differ in size by one sequence.
             for idx in torch.randperm(n, device=self.device).tensor_split(cfg.minibatches):
