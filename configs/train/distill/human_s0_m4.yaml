@@ -1,0 +1,23 @@
+# M6.1 distillation: the M4 human (human-s0-gpu1, trained on S0 against scripted zombies,
+# layout v1) as an extra pool seed and an S0 starter, on S0 with the M6 zombie counts against
+# the scripted zombies only.
+side: human
+teacher: /checkpoints/human/human-s0-gpu1/latest.pt
+env_config: configs/env/s0.yaml
+zombie_counts: [4, 6, 8]
+seed: 3
+total_steps: 10000000
+num_envs: 1024
+rollout: 128
+bptt: 64
+epochs: 2
+minibatches: 8
+lr: 0.0003
+beta_fraction: 0.3
+num_threads: 20
+torch_threads: 4
+device: cuda
+eval_every: 20
+eval_episodes: 128
+final_eval_episodes: 512
+checkpoint_every: 20

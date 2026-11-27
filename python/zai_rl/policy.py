@@ -40,6 +40,14 @@ def load_human_actor(path: Path, device: torch.device | str = "cpu") -> HumanAct
     return actor.to(device).eval()
 
 
+def load_zombie_actor(path: Path, device: torch.device | str = "cpu") -> ZombieActor:
+    """Frozen zombie actor of a checkpoint, on the checkpoint's observation layout."""
+    sd = torch.load(path, map_location=device, weights_only=False)
+    actor = ZombieActor(hidden=sd["mappo_config"]["hidden"], obs_version=checkpoint_obs_version(sd))
+    actor.load_state_dict(sd["actor"])
+    return actor.to(device).eval()
+
+
 class RecurrentHumanPolicy:
     """Batched human policy keeping one GRU state per environment."""
 
@@ -114,12 +122,7 @@ class RecurrentZombiePolicy:
         deterministic: bool = False,
         config: dict[str, Any] | None = None,
     ) -> "RecurrentZombiePolicy":
-        sd = torch.load(path, map_location=device, weights_only=False)
-        actor = ZombieActor(
-            hidden=sd["mappo_config"]["hidden"], obs_version=checkpoint_obs_version(sd)
-        ).to(device)
-        actor.load_state_dict(sd["actor"])
-        actor.eval()
+        actor = load_zombie_actor(path, device)
         return cls(actor, num_envs, num_zombies, device, deterministic, config)
 
     def reset(self, ended: np.ndarray) -> None:

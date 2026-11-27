@@ -23,6 +23,15 @@ ZombieFactory = Callable[[dict[str, Any], int, int, int], Any]
 HumanFactory = Callable[[dict[str, Any], int, int], Any]
 
 
+def per_group(factory: Any, groups: int) -> list[Any]:
+    """One opponent factory per group: a list is used as is, a single factory is shared."""
+    if isinstance(factory, list):
+        if len(factory) != groups:
+            raise ValueError("one opponent factory per zombie-count group")
+        return factory
+    return [factory] * groups
+
+
 def group_sizes(num_envs: int, groups: int) -> list[int]:
     """Envs per group: as equal as possible, summing to `num_envs`."""
     if num_envs < groups:
@@ -62,16 +71,21 @@ class HumanTrainingEnv:
         config: dict[str, Any],
         zombie_counts: list[int],
         num_envs: int,
-        zombie_factory: ZombieFactory,
+        zombie_factory: ZombieFactory | list[ZombieFactory],
         seed: int = 0,
         num_threads: int | None = None,
     ):
         sizes = group_sizes(num_envs, len(zombie_counts))
+        factories = per_group(zombie_factory, len(zombie_counts))
         self.groups = []
+        self.group_slices = []
+        start = 0
         for i, (n, size) in enumerate(zip(zombie_counts, sizes, strict=True)):
             cfg = deep_merge(config, {"zombie_count": n})
             venv = ZaiVecEnv(cfg, num_envs=size, seed=seed + 1000 * i, num_threads=num_threads)
-            self.groups.append((venv, zombie_factory(cfg, size, n, seed + 1000 * i + 1)))
+            self.groups.append((venv, factories[i](cfg, size, n, seed + 1000 * i + 1)))
+            self.group_slices.append(slice(start, start + size))
+            start += size
         self.num_envs = num_envs
         self._zombie_obs: list[np.ndarray] = []
 
@@ -145,18 +159,21 @@ class ZombieTrainingEnv:
         config: dict[str, Any],
         zombie_counts: list[int],
         num_envs: int,
-        human_factory: HumanFactory,
+        human_factory: HumanFactory | list[HumanFactory],
         seed: int = 0,
         num_threads: int | None = None,
     ):
         sizes = group_sizes(num_envs, len(zombie_counts))
+        factories = per_group(human_factory, len(zombie_counts))
         self.groups = []
         agent_env = []
         env_offset = 0
+        self.group_slices = []
         for i, (n, size) in enumerate(zip(zombie_counts, sizes, strict=True)):
             cfg = deep_merge(config, {"zombie_count": n})
             venv = ZaiVecEnv(cfg, num_envs=size, seed=seed + 1000 * i, num_threads=num_threads)
-            self.groups.append((venv, human_factory(cfg, size, seed + 1000 * i + 1), n))
+            self.groups.append((venv, factories[i](cfg, size, seed + 1000 * i + 1), n))
+            self.group_slices.append(slice(env_offset, env_offset + size))
             agent_env.append(np.repeat(np.arange(size) + env_offset, n))
             env_offset += size
         self.num_envs = num_envs

@@ -1,0 +1,24 @@
+# M6.1 distillation: the main zombie starter, from the crowd fine-tune of section 4.7
+# (stopped at 17 M steps, layout v1), on s0_small against the scripted human and the
+# fine-tuned human.
+side: zombie
+teacher: /checkpoints/zombie/zombie-s0small-crowd-ft1/latest.pt
+opponent: /checkpoints/human/human-s0small-ft1/final.pt
+env_config: configs/env/s0_small.yaml
+zombie_counts: [3, 6, 9]
+seed: 1
+total_steps: 10000000
+num_envs: 1024
+rollout: 128
+bptt: 64
+epochs: 2
+minibatches: 8
+lr: 0.0003
+beta_fraction: 0.3
+num_threads: 20
+torch_threads: 4
+device: cuda
+eval_every: 20
+eval_episodes: 128
+final_eval_episodes: 512
+checkpoint_every: 20
