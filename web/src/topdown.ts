@@ -167,11 +167,17 @@ export class TopDown {
     const er = Math.max(3, this.init.config.entity_radius_m * this.scale * 2);
     g.circle(hx, hy, er).fill(COLORS.human);
 
-    // Zombies.
-    this.curr.zombies.forEach((z, i) => {
+    // Zombies; the ones the human sees get an outline.
+    const at = (i: number): [number, number] => {
+      const z = this.curr!.zombies[i];
       const pz = this.prev!.zombies[i] ?? z;
-      g.circle(this.sx(lerp(pz[0], z[0])), this.sy(lerp(pz[1], z[1])), er);
-    });
+      return [this.sx(lerp(pz[0], z[0])), this.sy(lerp(pz[1], z[1]))];
+    };
+    this.curr.zombies.forEach((_, i) => g.circle(...at(i), er));
     g.fill(COLORS.zombie);
+    for (const i of this.curr.seen_zombies ?? []) {
+      if (i < this.curr.zombies.length) g.circle(...at(i), er + 2.5);
+    }
+    g.stroke({ color: COLORS.human, width: 1.5 });
   }
 }

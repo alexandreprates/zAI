@@ -64,7 +64,12 @@
           <div id="views" hidden>
             <button data-view="2d">2D</button>
             <button data-view="3d">3D</button>
-            <button id="follow" title="Keep the camera on the human (drag to orbit, scroll to zoom)">Follow</button>
+            <select id="camera" title="3D camera: orbit freely, follow the human, or see through its eyes">
+              <option value="follow">Follow</option>
+              <option value="orbit">Orbit</option>
+              <option value="first">First person</option>
+            </select>
+            <button id="xray" title="First person: show zombies the human cannot see, translucent" hidden>X-ray</button>
           </div>
           <input id="seek" type="range" min="0" max="0" value="0" hidden />
           <span id="status">Select a match or replay</span>
@@ -81,6 +86,12 @@
           <div><span class="label">Hunger</span> <span class="bar"><span id="hud-hunger"></span></span> <span id="hud-hunger-s"></span></div>
           <div><span class="label">Carried</span> <span id="hud-carried"></span></div>
           <div><span class="label">Outcome</span> <span id="hud-outcome"></span></div>
+          <div id="hud-fp" hidden>
+            <div><span class="label">Speed</span> <span id="hud-speed"></span></div>
+            <div><span class="label">Seen</span> <span id="hud-seen"></span></div>
+            <div><span class="label">Heading</span> <span id="hud-heading"></span></div>
+            <div id="hud-noise"></div>
+          </div>
         </div>
       </main>
     </div>

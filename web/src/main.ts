@@ -11,7 +11,8 @@ import {
 } from "./api";
 import { Charts } from "./charts";
 import { LeaguePanel } from "./league";
-import type { Scene3D } from "./scene3d";
+import { compass, headingYaw } from "./firstperson";
+import type { CameraMode, Scene3D } from "./scene3d";
 import { TopDown } from "./topdown";
 import type { Agent, Frame, InitFrame, ModelInfo, ReplaySummary, SnapshotFrame } from "./types";
 
@@ -23,7 +24,17 @@ const view = new TopDown();
 let scene3d: Scene3D | null = null;
 type ViewMode = "2d" | "3d";
 let viewMode: ViewMode = localStorage.getItem("zai.view") === "3d" ? "3d" : "2d";
-let follow = localStorage.getItem("zai.follow") !== "off";
+const CAMERA_MODES: CameraMode[] = ["follow", "orbit", "first"];
+const storedCamera = localStorage.getItem("zai.camera") as CameraMode | null;
+let camera: CameraMode =
+  storedCamera && CAMERA_MODES.includes(storedCamera)
+    ? storedCamera
+    : localStorage.getItem("zai.follow") === "off"
+      ? "orbit"
+      : "follow";
+let xray = false;
+/** First-person HUD: when the last own-noise flash started. */
+let noiseAt = 0;
 let charts: Charts;
 let league: LeaguePanel;
 let stream: Stream | null = null;
@@ -134,6 +145,24 @@ function renderControls(): void {
   $("hud-hunger-s").textContent = `${s.human.hunger.toFixed(0)} s`;
   $("hud-carried").textContent = String(s.human.carried);
   $("hud-outcome").textContent = s.outcome;
+  const fp = viewMode === "3d" && camera === "first";
+  $("hud-fp").hidden = !fp;
+  if (fp) {
+    const factor = Math.max(0, 1 - 0.2 * s.human.carried);
+    $("hud-speed").textContent = `${Math.round(factor * 100)}%`;
+    $("hud-seen").textContent = `${s.seen_zombies?.length ?? 0} zombies, ${s.seen_food?.length ?? 0} food`;
+    $("hud-heading").textContent = compass(headingYaw(s.human.hx, s.human.hy, 0));
+    // The human's own noise (pickup, door) flashes; walking is constant and not shown.
+    const loud = s.events.filter(([kind]) => kind > 0);
+    const noise = $("hud-noise");
+    if (loud.length) {
+      const [kind, , , radius] = loud[loud.length - 1];
+      noise.textContent = `${kind === 1 ? "pickup" : "door"} noise · ${radius.toFixed(0)} m`;
+      noiseAt = performance.now();
+    } else if (performance.now() - noiseAt > 1500) {
+      noise.textContent = "";
+    }
+  }
   const kind = init.source === "replay" ? "Replay" : "Match";
   $("status").textContent = `${kind} ${init.id} · episode ${init.episode} · ${s.speed > 0 ? `x${s.speed}` : "max"}${s.paused ? " · paused" : ""}`;
   const btn = $<HTMLButtonElement>("play-pause");
@@ -346,7 +375,8 @@ async function setView(mode: ViewMode): Promise<void> {
     const { Scene3D } = await import("./scene3d");
     scene3d = new Scene3D();
     scene3d.mount($("view-3d"));
-    scene3d.setFollow(follow);
+    scene3d.setCameraMode(camera);
+    scene3d.setXray(xray);
     // Catch up with the stream: the static map and the latest state.
     if (init) scene3d.setInit(init);
     if (last) scene3d.pushSnapshot(last);
@@ -359,20 +389,29 @@ async function setView(mode: ViewMode): Promise<void> {
   for (const b of document.querySelectorAll<HTMLButtonElement>("#views button[data-view]")) {
     b.classList.toggle("active", b.dataset.view === mode);
   }
-  $("follow").hidden = mode !== "3d";
+  $("camera").hidden = mode !== "3d";
+  $("xray").hidden = mode !== "3d" || camera !== "first";
+  renderControls();
 }
 
 function setupControls(): void {
   for (const b of document.querySelectorAll<HTMLButtonElement>("#views button[data-view]")) {
     b.onclick = () => void setView(b.dataset.view as ViewMode);
   }
-  const followBtn = $<HTMLButtonElement>("follow");
-  followBtn.classList.toggle("active", follow);
-  followBtn.onclick = () => {
-    follow = !follow;
-    localStorage.setItem("zai.follow", follow ? "on" : "off");
-    followBtn.classList.toggle("active", follow);
-    scene3d?.setFollow(follow);
+  const cameraSel = $<HTMLSelectElement>("camera");
+  cameraSel.value = camera;
+  cameraSel.onchange = () => {
+    camera = cameraSel.value as CameraMode;
+    localStorage.setItem("zai.camera", camera);
+    scene3d?.setCameraMode(camera);
+    $("xray").hidden = viewMode !== "3d" || camera !== "first";
+    renderControls();
+  };
+  const xrayBtn = $<HTMLButtonElement>("xray");
+  xrayBtn.onclick = () => {
+    xray = !xray;
+    xrayBtn.classList.toggle("active", xray);
+    scene3d?.setXray(xray);
   };
   const speeds = $("speeds");
   for (const s of SPEEDS) {

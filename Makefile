@@ -99,9 +99,10 @@ ci-py-develop:
 	uv pip install -e python
 	maturin develop --uv --release -m crates/zai-py/Cargo.toml
 
-ci-test: ci-py-develop
+ci-test: ci-py-develop ci-web-install
 	cargo test --workspace --exclude zai-py
 	pytest python
+	cd web && npm test
 
 ci-web-install:
 	cd web && npm ci

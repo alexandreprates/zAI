@@ -40,6 +40,9 @@ export interface SnapshotFrame {
   /** [kind (0 walk, 1 pickup, 2 door), x, y, radius] */
   events: [number, number, number, number][];
   outcome: "running" | "caught" | "starved" | "truncated";
+  /** Indices into `zombies` / `food` of what the human sees (its observation's rule). */
+  seen_zombies: number[];
+  seen_food: number[];
 }
 
 export type Frame = InitFrame | SnapshotFrame;

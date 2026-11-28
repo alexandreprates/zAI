@@ -1,7 +1,18 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
+import { headingYaw, lerpYaw, verticalFov, visibility } from "./firstperson";
 import type { InitFrame, SnapshotFrame } from "./types";
+
+// Radial fog: three's default fog uses view depth, which at the edges of a 120 degree view
+// would show objects up to twice the fog range away; vision is a radius (4.9.6).
+THREE.ShaderChunk.fog_vertex = THREE.ShaderChunk.fog_vertex.replace(
+  "vFogDepth = - mvPosition.z;",
+  "vFogDepth = length( mvPosition.xyz );",
+);
+
+/** `orbit`: free camera; `follow`: orbit around the human; `first`: the human's eyes. */
+export type CameraMode = "orbit" | "follow" | "first";
 
 // Soft pastel look: light floor, cream walls, rounded characters with eyes.
 const COLORS = {
@@ -32,6 +43,12 @@ const WALL_THICKNESS = 0.3;
 const RING_MS = 900;
 const FALL_MS = 600;
 const MAX_FOOD = 512;
+// First person: eye height, the caught camera's resting height, and zombies drawn 1.75 m tall
+// (visual only; the collision radius stays 0.3 m, the capsule is ~0.99 m).
+const EYE_M = 1.6;
+const FALLEN_EYE_M = 0.4;
+const ZOMBIE_FP_SCALE = 1.75 / 0.99;
+const FP_FOG = [70, 100];
 
 interface Ring {
   line: THREE.LineLoop;
@@ -44,12 +61,15 @@ interface Character {
   root: THREE.Group;
   /** Body, tipped over when the human dies; bobs while walking. */
   body: THREE.Group;
+  /** Drawn translucent (first-person x-ray of an unseen zombie). */
+  ghost?: boolean;
 }
 
 const ground = (x: number, y: number, h = 0) => new THREE.Vector3(x, h, -y);
 
-/** Third-person 3D renderer over the same frames as the top-down view (world y-up maps to
- * three's -z, so the map reads the same way from the default camera). Interpolates between
+/** 3D renderer over the same frames as the top-down view (world y-up maps to three's -z, so
+ * the map reads the same way from the default camera): an orbit or follow camera, or the
+ * human's first-person view, which draws only what the human sees. Interpolates between
  * decision-step snapshots like `TopDown`. */
 export class Scene3D {
   private renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -79,9 +99,16 @@ export class Scene3D {
   private endedAt = 0;
   /** Characters are drawn larger than their 0.3 m radius on big maps so they stay visible. */
   private bodyScale = 1;
-  private follow = true;
+  private mode: CameraMode = "follow";
+  private xray = false;
   private focus = new THREE.Vector3();
   private framedSize = -1;
+  private fog = new THREE.Fog(COLORS.sky, FP_FOG[0], FP_FOG[1]);
+  private yaw = 0;
+  /** Tint over the first-person view: red when caught, grey when starved. */
+  private overlay = document.createElement("div");
+  private fpsEl: HTMLElement | null = null;
+  private frameTimes: number[] = [];
 
   constructor() {
     const r = this.renderer;
@@ -129,6 +156,13 @@ export class Scene3D {
   mount(el: HTMLElement): void {
     this.el = el;
     el.appendChild(this.renderer.domElement);
+    this.overlay.className = "fp-overlay";
+    el.appendChild(this.overlay);
+    if (new URLSearchParams(location.search).has("fps")) {
+      this.fpsEl = document.createElement("div");
+      this.fpsEl.className = "fps";
+      el.appendChild(this.fpsEl);
+    }
     new ResizeObserver(() => this.resize()).observe(el);
     this.resize();
   }
@@ -143,16 +177,50 @@ export class Scene3D {
     }
   }
 
-  /** Follow mode keeps the camera's orbit around the human; otherwise it is free. */
-  setFollow(follow: boolean): void {
-    this.follow = follow;
-    if (follow && this.curr) {
+  /** Follow keeps the camera's orbit around the human, orbit is free, first is the human's
+   * eyes (120 degree view, fog at the 100 m vision radius, only what the human sees). */
+  setCameraMode(mode: CameraMode): void {
+    const wasFirst = this.mode === "first";
+    this.mode = mode;
+    const first = mode === "first";
+    this.controls.enabled = !first;
+    if (first !== wasFirst) {
+      this.scene.fog = first ? this.fog : null;
+      this.camera.near = first ? 0.05 : 0.1;
+      this.camera.far = first ? FP_FOG[1] + 5 : 3000;
+      // Fog is compiled into the shaders.
+      this.scene.traverse((o) => {
+        if (o instanceof THREE.Mesh || o instanceof THREE.Line) {
+          (Array.isArray(o.material) ? o.material : [o.material]).forEach((m) => (m.needsUpdate = true));
+        }
+      });
+      this.applyScale();
+      this.resize();
+      if (!first) this.camera.rotation.set(0, 0, 0);
+      this.overlay.style.opacity = "0";
+      this.overlay.textContent = "";
+    }
+    if (this.curr) this.updateFood(this.curr);
+    if (first) return;
+    if (mode === "follow" && this.curr) {
       const h = this.curr.human;
       this.focus.copy(ground(h.x, h.y));
       this.placeCamera(this.focus, 14 * this.bodyScale);
     } else if (this.init) {
       this.frameMap();
     }
+  }
+
+  /** First person: show unseen zombies translucent instead of hiding them. */
+  setXray(xray: boolean): void {
+    this.xray = xray;
+  }
+
+  /** Characters at true scale in first person (zombies 1.75 m tall), enlarged otherwise. */
+  private applyScale(): void {
+    const first = this.mode === "first";
+    this.human.root.scale.setScalar(this.bodyScale);
+    for (const z of this.zombies) z.root.scale.setScalar(first ? ZOMBIE_FP_SCALE : this.bodyScale);
   }
 
   setInit(frame: InitFrame): void {
@@ -163,7 +231,7 @@ export class Scene3D {
     for (const ring of this.rings) this.disposeRing(ring);
     this.rings = [];
     this.bodyScale = Math.min(3, Math.max(1, frame.map_size / 60));
-    this.human.root.scale.setScalar(this.bodyScale);
+    this.applyScale();
     this.buildMap(frame);
     this.buildVision(frame);
     if (frame.map_size !== this.framedSize) {
@@ -190,15 +258,24 @@ export class Scene3D {
     }
     this.updateFood(frame);
     this.ensureZombies(frame.zombies.length);
-    if (first && this.follow) this.setFollow(true);
+    if (first && this.mode === "follow") this.setCameraMode("follow");
   }
 
   private loop = (): void => {
     if (!this.active) return;
     this.frameId = requestAnimationFrame(this.loop);
-    this.update(performance.now());
-    this.controls.update();
+    const now = performance.now();
+    this.update(now);
+    if (this.mode !== "first") this.controls.update();
     this.renderer.render(this.scene, this.camera);
+    if (this.fpsEl) {
+      this.frameTimes.push(performance.now() - now);
+      if (this.frameTimes.length >= 60) {
+        const ms = this.frameTimes.reduce((a, b) => a + b, 0) / this.frameTimes.length;
+        this.fpsEl.textContent = `${ms.toFixed(1)} ms/frame (render)`;
+        this.frameTimes = [];
+      }
+    }
   };
 
   private resize(): void {
@@ -209,6 +286,7 @@ export class Scene3D {
     this.renderer.domElement.style.width = "100%";
     this.renderer.domElement.style.height = "100%";
     this.camera.aspect = w / h;
+    this.camera.fov = this.mode === "first" ? verticalFov(120, w / h) : 50;
     this.camera.updateProjectionMatrix();
   }
 
@@ -467,7 +545,22 @@ export class Scene3D {
     }
     this.zombies.forEach((z, i) => {
       z.root.visible = i < n;
-      z.root.scale.setScalar(this.bodyScale);
+    });
+    this.applyScale();
+  }
+
+  /** Makes a zombie translucent (x-ray) or opaque again. */
+  private setGhost(c: Character, ghost: boolean): void {
+    if (!!c.ghost === ghost) return;
+    c.ghost = ghost;
+    c.root.traverse((o) => {
+      if (o instanceof THREE.Mesh) {
+        const m = o.material as THREE.Material;
+        m.transparent = ghost;
+        m.opacity = ghost ? 0.3 : 1;
+        m.depthWrite = !ghost;
+        o.castShadow = !ghost;
+      }
     });
   }
 
@@ -484,10 +577,13 @@ export class Scene3D {
     const m = new THREE.Matrix4();
     const q = new THREE.Quaternion();
     const up = new THREE.Vector3(0, 1, 0);
-    const scale = new THREE.Vector3().setScalar(Math.min(2, this.bodyScale));
-    const n = Math.min(MAX_FOOD, frame.food.length);
+    const first = this.mode === "first";
+    const scale = new THREE.Vector3().setScalar(first ? 1 : Math.min(2, this.bodyScale));
+    // First person: only the packages the human sees.
+    const list = first ? (frame.seen_food ?? []).map((k) => frame.food[k]) : frame.food;
+    const n = Math.min(MAX_FOOD, list.length);
     for (let i = 0; i < n; i++) {
-      const [x, y] = frame.food[i];
+      const [x, y] = list[i];
       // Stable per-position yaw so packages do not spin as the list changes.
       q.setFromAxisAngle(up, ((x * 12.9898 + y * 78.233) % 1) * Math.PI * 2);
       m.compose(ground(x, y, 0.15 * scale.y), q, scale);
@@ -522,6 +618,8 @@ export class Scene3D {
       }
       ring.line.scale.setScalar(Math.max(0.01, ring.radius * Math.min(1, k * 1.5)));
       (ring.line.material as THREE.LineBasicMaterial).opacity = 1 - k;
+      // First person: all noise is the human's own; the HUD flashes it instead.
+      ring.line.visible = this.mode !== "first";
       return true;
     });
 
@@ -547,16 +645,29 @@ export class Scene3D {
     this.human.body.rotation.x = fall * (Math.PI / 2);
     this.vision.position.copy(ground(hx, hy));
     this.vision.rotation.y = Math.atan2(c.hy, c.hx);
-    this.vision.visible = !dead;
+    const first = this.mode === "first";
+    this.vision.visible = !dead && !first;
+    this.human.root.visible = !first;
 
+    const seen = first ? visibility(curr.zombies.length, curr.seen_zombies, this.xray) : null;
     curr.zombies.forEach((z, i) => {
       const pz = prev.zombies[i] ?? z;
       const moving = animate && (pz[0] !== z[0] || pz[1] !== z[1]);
-      this.place(this.zombies[i], lerp(pz[0], z[0]), lerp(pz[1], z[1]), z[2], z[3], moving, now, i * 1.7);
+      const zc = this.zombies[i];
+      this.place(zc, lerp(pz[0], z[0]), lerp(pz[1], z[1]), z[2], z[3], moving, now, i * 1.7);
+      zc.root.visible = seen ? seen[i] !== "hidden" : true;
+      this.setGhost(zc, seen ? seen[i] === "xray" : false);
     });
 
-    const focus = this.follow ? ground(hx, hy) : this.controls.target.clone();
-    if (this.follow) {
+    if (first) {
+      this.firstPerson(prev, curr, hx, hy, t, humanMoving, now);
+      this.sun.target.position.copy(ground(hx, hy));
+      this.sun.position.copy(ground(hx, hy)).add(new THREE.Vector3(-30, 60, 25));
+      return;
+    }
+    const follow = this.mode === "follow";
+    const focus = follow ? ground(hx, hy) : this.controls.target.clone();
+    if (follow) {
       // Move target and camera together, so the user's orbit angle and zoom are kept.
       const delta = focus.clone().sub(this.controls.target).multiplyScalar(0.2);
       this.controls.target.add(delta);
@@ -565,5 +676,45 @@ export class Scene3D {
     // Shadows cover a window around the point of interest.
     this.sun.target.position.copy(focus);
     this.sun.position.copy(focus).add(new THREE.Vector3(-30, 60, 25));
+  }
+
+  /** Camera at the human's eyes: shortest-arc yaw over the decision interval, a small walking
+   * bob, a fall with a red tint when caught, grey when starved, "survived" when truncated. */
+  private firstPerson(
+    prev: SnapshotFrame,
+    curr: SnapshotFrame,
+    hx: number,
+    hy: number,
+    t: number,
+    moving: boolean,
+    now: number,
+  ): void {
+    const from = headingYaw(prev.human.hx, prev.human.hy, this.yaw);
+    const to = headingYaw(curr.human.hx, curr.human.hy, from);
+    this.yaw = lerpYaw(from, to, t);
+    const ended = this.endedAt > 0 ? Math.min(1, (now - this.endedAt) / FALL_MS) : 0;
+    const caught = curr.outcome === "caught";
+    const bob = moving && this.endedAt === 0 ? Math.sin(now / 170) * 0.03 : 0;
+    const eye = caught ? EYE_M + (FALLEN_EYE_M - EYE_M) * ended : EYE_M;
+    this.camera.position.copy(ground(hx, hy, eye + bob));
+    // three's camera looks along -z; heading yaw a maps to rotation.y = a - pi/2.
+    this.camera.rotation.set(caught ? 0.5 * ended : 0, this.yaw - Math.PI / 2, caught ? 0.6 * ended : 0, "YXZ");
+    const o = this.overlay;
+    if (curr.outcome === "running") {
+      o.style.opacity = "0";
+      o.textContent = "";
+    } else if (caught) {
+      o.style.background = "rgba(190, 20, 20, 0.45)";
+      o.style.opacity = String(ended);
+      o.textContent = "caught";
+    } else if (curr.outcome === "starved") {
+      o.style.background = "rgba(90, 90, 90, 0.6)";
+      o.style.opacity = String(ended);
+      o.textContent = "starved";
+    } else {
+      o.style.background = "transparent";
+      o.style.opacity = "1";
+      o.textContent = "survived";
+    }
   }
 }
