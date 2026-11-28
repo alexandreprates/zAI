@@ -9,13 +9,16 @@ unexport DOCKER_DEFAULT_PLATFORM
 DEV := docker compose run --rm -T dev
 GPU := docker compose -f compose.yaml -f compose.gpu.yaml
 
-.PHONY: test lint fmt shell build up train-league train-league-gpu arena-gpu probe-gpu distill-gpu export-model export-model-gpu train-human train-human-gpu tensorboard web-install web-dev check-gpu ci-test ci-lint ci-fmt ci-py-develop ci-web-install
+.PHONY: test lint fmt proto shell build up train-league train-league-gpu arena-gpu probe-gpu distill-gpu export-model export-model-gpu train-human train-human-gpu tensorboard web-install web-dev check-gpu ci-test ci-lint ci-proto ci-proto-check ci-fmt ci-py-develop ci-web-install
 
 test: ## Run Rust and Python tests
 	$(DEV) make ci-test
 
-lint: ## Run rustfmt check, clippy, ruff and the TypeScript type check
+lint: ## Run rustfmt check, clippy, ruff, the gRPC stub drift check and the TypeScript type check
 	$(DEV) make ci-lint
+
+proto: ## Regenerate the Python gRPC stubs (python/zai_agent/proto) from proto/zai/v1/agent.proto
+	$(DEV) make ci-proto
 
 fmt: ## Format Rust and Python code
 	$(DEV) make ci-fmt
@@ -91,7 +94,20 @@ ci-test: ci-py-develop
 ci-web-install:
 	cd web && npm ci
 
-ci-lint: ci-web-install
+# Stubs import package-relative (`zai_agent.proto`) through the -I mapping.
+PROTOC_PY = python -m grpc_tools.protoc -Izai_agent/proto=../proto/zai/v1 ../proto/zai/v1/agent.proto
+
+ci-proto:
+	cd python && $(PROTOC_PY) --python_out=. --pyi_out=. --grpc_python_out=.
+
+ci-proto-check:
+	@tmp=$$(mktemp -d) && cd python && $(PROTOC_PY) --python_out=$$tmp --pyi_out=$$tmp --grpc_python_out=$$tmp \
+		&& for f in agent_pb2.py agent_pb2.pyi agent_pb2_grpc.py; do \
+			cmp -s $$tmp/zai_agent/proto/$$f zai_agent/proto/$$f \
+				|| { echo "python/zai_agent/proto/$$f is stale: run make proto"; exit 1; }; \
+		done
+
+ci-lint: ci-web-install ci-proto-check
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	ruff check python

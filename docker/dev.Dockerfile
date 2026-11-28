@@ -23,6 +23,9 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/python \
 RUN uv python install 3.12 \
     && uv venv --python 3.12 /opt/venv \
     && uv pip install "maturin>=1.9,<2" "pytest>=8.3" "ruff>=0.12" \
+    # Generates the gRPC stubs of python/zai_agent/proto (make proto); its protobuf major must
+    # match the runtime pin in python/pyproject.toml.
+    && uv pip install "grpcio-tools==1.85.4" \
     && uv pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.8.0"
 
 WORKDIR /workspace

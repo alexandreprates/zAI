@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod frames;
+pub mod grpc;
 pub mod leagues;
 pub mod matches;
 pub mod metrics;
@@ -21,6 +22,7 @@ use tokio::sync::broadcast;
 use tower_http::services::{ServeDir, ServeFile};
 use zai_sim::Config;
 
+pub use crate::grpc::grpc_service;
 use crate::leagues::LeagueStore;
 use crate::matches::MatchHandle;
 use crate::metrics::MetricsStore;

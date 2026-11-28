@@ -7,7 +7,8 @@
 # inside the compose network (trainers post metrics there).
 services:
   server:
-    ports: !reset []
+    # Caddy takes 8080; the agent API stays published on localhost only.
+    ports: !override ["127.0.0.1:50051:50051"]
 
   proxy:
     image: caddy:2.10.2-alpine

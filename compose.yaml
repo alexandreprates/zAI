@@ -18,6 +18,9 @@ services:
       dockerfile: docker/server.Dockerfile
     ports:
       - "8080:8080"
+      # Agent API (gRPC): local only, reach it from another machine through an SSH tunnel
+      # (docs/ARCHITECTURE.md 4.9, decision E10).
+      - "127.0.0.1:50051:50051"
     volumes:
       - data:/data
 
