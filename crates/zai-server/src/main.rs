@@ -3,7 +3,8 @@
 //! Environment: `ZAI_HTTP_ADDR` (default `0.0.0.0:8080`), `ZAI_GRPC_ADDR` (agent API, default
 //! `0.0.0.0:50051`), `ZAI_DATA_DIR` (default `./data`,
 //! holds `replays/` and `metrics.db`), `ZAI_WEB_DIR` (built viewer, optional),
-//! `ZAI_ZOMBIE_COUNT` / `ZAI_FOOD_COUNT` (base config overrides), `RUST_LOG`.
+//! `ZAI_ZOMBIE_COUNT` / `ZAI_FOOD_COUNT` (base config overrides), `ZAI_REMOTE_JOIN_TIMEOUT_S` /
+//! `ZAI_REMOTE_TIMEOUT_S` / `ZAI_MAX_REMOTE_MATCHES` (remote sides), `RUST_LOG`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,11 +37,13 @@ async fn main() {
         std::process::exit(2);
     }
     let web_dir = std::env::var("ZAI_WEB_DIR").ok().map(PathBuf::from);
-    let state = Arc::new(AppState::new(
+    let mut state = AppState::new(
         base_config,
         data_dir.join("replays"),
         Some(data_dir.join("metrics.db")),
-    ));
+    );
+    state.remote = zai_server::remote::RemoteSettings::from_env();
+    let state = Arc::new(state);
 
     let addr = std::env::var("ZAI_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = match tokio::net::TcpListener::bind(&addr).await {

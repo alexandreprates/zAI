@@ -44,8 +44,15 @@ export interface SnapshotFrame {
 
 export type Frame = InitFrame | SnapshotFrame;
 
-/** A side of a match: a built-in bot or a trained model (`GET /api/models`). */
-export type Agent = "scripted" | "random" | { policy: string };
+/** A side of a match: a built-in bot, a trained model (`GET /api/models`) or a remote gRPC
+ * agent (`zai_agent`). */
+export type Agent = "scripted" | "random" | "remote" | { policy: string };
+
+/** Per side: a remote side's state or a remote agent's name (`null` for other sides). */
+export interface PerSide<T> {
+  human: T | null;
+  zombies: T | null;
+}
 
 export interface ModelInfo {
   id: string;
@@ -73,9 +80,13 @@ export interface MatchInfo {
   time: number;
   speed: number;
   paused: boolean;
-  status: "running" | "finished" | "stopped" | "failed";
+  status: "waiting" | "running" | "finished" | "stopped" | "failed";
   outcome: string;
   replays: string[];
+  remote: PerSide<"waiting" | "joined" | "left">;
+  agent_names: PerSide<string>;
+  /** Realtime mode: actions that missed their deadline. */
+  late_actions: number;
 }
 
 export interface ReplaySummary {

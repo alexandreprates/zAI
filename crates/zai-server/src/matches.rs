@@ -1,5 +1,6 @@
-//! Live matches between bots or trained policies (`policy.rs`), run as tokio tasks in real time
-//! (speed x0.25-x16, or unthrottled with speed 0). Every finished episode is stored as a replay.
+//! Live matches between bots, trained policies (`policy.rs`) and remote gRPC agents
+//! (`remote.rs`), run as tokio tasks in real time (speed x0.25-x16, or unthrottled with speed
+//! 0). Every finished episode is stored as a replay.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,16 +12,21 @@ use zai_sim::bots::{BotKind, HumanBot, ZombieBot};
 use zai_sim::{Config, Env, HumanAction, Outcome};
 
 use crate::frames;
+use crate::grpc::pb::{self, server_message::Msg};
 use crate::policy::{LoadedModel, PolicyAgent};
+use crate::remote::{
+    human_action, Conn, JoinSlot, MatchSide, RemoteError, RemoteSettings, RemoteSide, RemoteState,
+};
 use crate::replay::{Replay, ReplayStore};
 
-/// Who plays one side of a match: a built-in bot or a trained model from the model store.
-/// JSON: `"scripted"`, `"random"` or `{"policy": "<model id>"}`.
+/// Who plays one side of a match: a built-in bot, a trained model from the model store, or a
+/// remote gRPC client. JSON: `"scripted"`, `"random"`, `"remote"` or `{"policy": "<model id>"}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Agent {
     Scripted,
     Random,
+    Remote,
     Policy(String),
 }
 
@@ -29,8 +35,12 @@ impl Agent {
         match self {
             Agent::Scripted => Some(BotKind::Scripted),
             Agent::Random => Some(BotKind::Random),
-            Agent::Policy(_) => None,
+            Agent::Policy(_) | Agent::Remote => None,
         }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Agent::Remote)
     }
 
     pub fn model_id(&self) -> Option<&str> {
@@ -121,11 +131,38 @@ pub fn clamp_speed(speed: f32) -> f32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchStatus {
+    /// Remote sides have not joined yet.
+    Waiting,
     Running,
     Finished,
     Stopped,
-    /// A policy failed to run; `outcome` holds the error.
+    /// A policy failed to run or a remote side failed; `outcome` holds the reason.
     Failed,
+}
+
+/// Per side: the state of a remote side (`None` for other sides), or a remote agent's name.
+#[derive(Clone, Debug, Serialize)]
+pub struct PerSide<T> {
+    pub human: Option<T>,
+    pub zombies: Option<T>,
+}
+
+impl<T> Default for PerSide<T> {
+    fn default() -> Self {
+        Self {
+            human: None,
+            zombies: None,
+        }
+    }
+}
+
+impl<T> PerSide<T> {
+    pub fn get_mut(&mut self, side: MatchSide) -> &mut Option<T> {
+        match side {
+            MatchSide::Human => &mut self.human,
+            MatchSide::Zombies => &mut self.zombies,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -146,6 +183,10 @@ pub struct MatchInfo {
     pub status: MatchStatus,
     pub outcome: String,
     pub replays: Vec<String>,
+    pub remote: PerSide<RemoteState>,
+    pub agent_names: PerSide<String>,
+    /// Realtime mode: actions that arrived after their deadline (0 in lockstep).
+    pub late_actions: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -163,12 +204,22 @@ pub struct MatchHandle {
     pub frames: broadcast::Sender<Bytes>,
     /// Latest `(init, snapshot)` frames, sent first to viewers that join mid-episode.
     pub latest: Arc<Mutex<(Bytes, Bytes)>>,
+    /// Join slots of the remote sides, indexed by `MatchSide::index`.
+    pub join: [Option<JoinSlot>; 2],
+    pub config: Arc<Config>,
 }
 
 impl MatchHandle {
     pub fn control(&self, c: Control) {
         // The task may have finished; controlling a finished match is a no-op.
         let _ = self.control.send(c);
+    }
+
+    /// Whether the match has a remote side and is still waiting or running.
+    pub fn is_live_remote(&self) -> bool {
+        let info = self.info.lock().expect("match info lock");
+        (info.human.is_remote() || info.zombies.is_remote())
+            && matches!(info.status, MatchStatus::Waiting | MatchStatus::Running)
     }
 }
 
@@ -183,12 +234,28 @@ pub fn start(
     cfg: Config,
     req: &MatchRequest,
     base_seed: u64,
-    now: u64,
     replays: ReplayStore,
     models: MatchModels,
+    remote: RemoteSettings,
 ) -> MatchHandle {
+    let now = crate::unix_now();
     let env = Env::new(cfg.clone(), episode_seed(base_seed, 0)).expect("validated config");
     let speed = clamp_speed(req.speed);
+    let mut join = [None, None];
+    let mut join_rx = [None, None];
+    let mut remote_state = PerSide::default();
+    for (side, agent) in [
+        (MatchSide::Human, &req.human),
+        (MatchSide::Zombies, &req.zombies),
+    ] {
+        if agent.is_remote() {
+            let (slot, rx) = JoinSlot::new();
+            join[side.index()] = Some(slot);
+            join_rx[side.index()] = Some(rx);
+            *remote_state.get_mut(side) = Some(RemoteState::Waiting);
+        }
+    }
+    let waiting = join_rx.iter().any(Option::is_some);
     let info = Arc::new(Mutex::new(MatchInfo {
         id: id.clone(),
         created_at: now,
@@ -203,9 +270,16 @@ pub fn start(
         speed,
         paused: false,
         auto_restart: req.auto_restart,
-        status: MatchStatus::Running,
-        outcome: "running".into(),
+        status: if waiting {
+            MatchStatus::Waiting
+        } else {
+            MatchStatus::Running
+        },
+        outcome: if waiting { "waiting" } else { "running" }.into(),
         replays: Vec::new(),
+        remote: remote_state,
+        agent_names: PerSide::default(),
+        late_actions: 0,
     }));
     let (control, rx) = mpsc::unbounded_channel();
     let (frames_tx, _) = broadcast::channel(256);
@@ -218,6 +292,8 @@ pub fn start(
         control,
         frames: frames_tx,
         latest,
+        join,
+        config: Arc::new(cfg.clone()),
     };
     let task = MatchTask {
         id,
@@ -233,6 +309,8 @@ pub fn start(
         handle: handle.clone(),
         replays,
         rx,
+        join_rx,
+        remote,
     };
     tokio::spawn(task.run());
     handle
@@ -252,27 +330,146 @@ struct MatchTask {
     handle: MatchHandle,
     replays: ReplayStore,
     rx: mpsc::UnboundedReceiver<Control>,
+    join_rx: [Option<tokio::sync::oneshot::Receiver<Conn>>; 2],
+    remote: RemoteSettings,
 }
 
+/// Remote sides of a running match, indexed by `MatchSide::index`.
+type Remotes = [Option<RemoteSide>; 2];
+
 impl MatchTask {
-    fn drivers(&self, seed: u64) -> (HumanDriver, ZombieDriver) {
+    /// In-process drivers of one episode; `None` for remote sides.
+    fn drivers(&self, seed: u64) -> (Option<HumanDriver>, Option<ZombieDriver>) {
         let human_seed = seed ^ 0x4855_4d41_4e00_0000;
         let zombie_seed = seed ^ 0x5a4f_4d42_4945_0000;
         let human = match (self.human.bot(), &self.models.human) {
-            (Some(kind), _) => HumanDriver::Bot(HumanBot::new(kind, human_seed)),
-            (None, Some(m)) => {
-                HumanDriver::Policy(PolicyAgent::new(m.clone(), human_seed, self.deterministic))
-            }
+            _ if self.human.is_remote() => None,
+            (Some(kind), _) => Some(HumanDriver::Bot(HumanBot::new(kind, human_seed))),
+            (None, Some(m)) => Some(HumanDriver::Policy(PolicyAgent::new(
+                m.clone(),
+                human_seed,
+                self.deterministic,
+            ))),
             (None, None) => unreachable!("policy sides are loaded before the match starts"),
         };
         let zombies = match (self.zombies.bot(), &self.models.zombies) {
-            (Some(kind), _) => ZombieDriver::Bot(ZombieBot::new(kind, zombie_seed)),
-            (None, Some(m)) => {
-                ZombieDriver::Policy(PolicyAgent::new(m.clone(), zombie_seed, self.deterministic))
-            }
+            _ if self.zombies.is_remote() => None,
+            (Some(kind), _) => Some(ZombieDriver::Bot(ZombieBot::new(kind, zombie_seed))),
+            (None, Some(m)) => Some(ZombieDriver::Policy(PolicyAgent::new(
+                m.clone(),
+                zombie_seed,
+                self.deterministic,
+            ))),
             (None, None) => unreachable!("policy sides are loaded before the match starts"),
         };
         (human, zombies)
+    }
+
+    fn set_remote_state(&self, side: MatchSide, state: RemoteState) {
+        let mut info = self.handle.info.lock().expect("match info lock");
+        *info.remote.get_mut(side) = Some(state);
+    }
+
+    /// Sends `MatchEnd` to every joined remote side and marks them as left.
+    async fn end_remotes(&self, remotes: &Remotes, status: &str, reason: &str) {
+        for r in remotes.iter().flatten() {
+            let _ = r
+                .send(Msg::MatchEnd(pb::MatchEnd {
+                    status: status.into(),
+                    reason: reason.into(),
+                }))
+                .await;
+            self.set_remote_state(r.side, RemoteState::Left);
+        }
+    }
+
+    /// Fails the match: the offending client gets its status, the others `MatchEnd{failed}`.
+    async fn fail(&self, remotes: &Remotes, offender: Option<MatchSide>, err: RemoteError) {
+        tracing::warn!("match {}: {}", self.id, err.reason);
+        {
+            let mut info = self.handle.info.lock().expect("match info lock");
+            info.status = MatchStatus::Failed;
+            info.outcome = err.reason.clone();
+        }
+        for r in remotes.iter().flatten() {
+            if Some(r.side) == offender {
+                if let Some(status) = err.status.clone() {
+                    let _ = r.conn.tx.send(Err(status)).await;
+                }
+                self.set_remote_state(r.side, RemoteState::Left);
+            }
+        }
+        for r in remotes.iter().flatten() {
+            if Some(r.side) != offender {
+                let _ = r
+                    .send(Msg::MatchEnd(pb::MatchEnd {
+                        status: "failed".into(),
+                        reason: err.reason.clone(),
+                    }))
+                    .await;
+                self.set_remote_state(r.side, RemoteState::Left);
+            }
+        }
+    }
+
+    /// Waits for every remote side to join (`None`: the match was stopped or failed).
+    async fn join_remotes(&mut self) -> Option<Remotes> {
+        let mut remotes: Remotes = [None, None];
+        let deadline = tokio::time::Instant::now() + self.remote.join_timeout;
+        for side in [MatchSide::Human, MatchSide::Zombies] {
+            let Some(mut rx) = self.join_rx[side.index()].take() else {
+                continue;
+            };
+            let conn = loop {
+                tokio::select! {
+                    r = &mut rx => break r.ok(),
+                    _ = tokio::time::sleep_until(deadline) => break None,
+                    c = self.rx.recv() => {
+                        match c {
+                            Some(c) => self.apply(c),
+                            None => self.stopped = true,
+                        }
+                        if self.stopped {
+                            self.end_remotes(&remotes, "stopped", "stopped while waiting").await;
+                            let mut info = self.handle.info.lock().expect("match info lock");
+                            info.status = MatchStatus::Stopped;
+                            info.outcome = "stopped".into();
+                            return None;
+                        }
+                    }
+                }
+            };
+            let Some(conn) = conn else {
+                let err = RemoteError {
+                    reason: format!("remote {} did not join", side.name()),
+                    status: None,
+                };
+                self.fail(&remotes, None, err).await;
+                return None;
+            };
+            {
+                let mut info = self.handle.info.lock().expect("match info lock");
+                *info.agent_names.get_mut(side) = Some(conn.agent_name.clone());
+                *info.remote.get_mut(side) = Some(RemoteState::Joined);
+            }
+            let r = RemoteSide::new(side, conn);
+            let joined = Msg::Joined(pb::Joined {
+                match_id: self.id.clone(),
+                side: side.proto() as i32,
+                realtime: false,
+                decision_dt: self.cfg.decision_dt(),
+            });
+            if let Err(e) = r.send(joined).await {
+                remotes[side.index()] = Some(r);
+                self.fail(&remotes, Some(side), e).await;
+                return None;
+            }
+            remotes[side.index()] = Some(r);
+        }
+        let mut info = self.handle.info.lock().expect("match info lock");
+        info.status = MatchStatus::Running;
+        info.outcome = "running".into();
+        Some(remotes)
     }
 
     fn apply(&mut self, c: Control) {
@@ -300,6 +497,14 @@ impl MatchTask {
     }
 
     async fn run(mut self) {
+        let mut remotes: Remotes = [None, None];
+        if self.join_rx.iter().any(Option::is_some) {
+            match self.join_remotes().await {
+                Some(r) => remotes = r,
+                None => return,
+            }
+        }
+        let config_json = serde_json::to_string(&self.cfg).unwrap_or_default();
         let mut episode = 0u32;
         loop {
             let seed = episode_seed(self.base_seed, episode);
@@ -316,8 +521,28 @@ impl MatchTask {
             }
             self.publish(frames::init(&env, "live", &self.id, episode, None), true);
             self.publish(frames::snapshot(&env, self.speed, self.paused), false);
+            let n = env.zombies().len();
+            for r in remotes.iter().flatten() {
+                let start = Msg::Start(pb::EpisodeStart {
+                    episode,
+                    seed,
+                    num_agents: if r.side == MatchSide::Human {
+                        1
+                    } else {
+                        n as u32
+                    },
+                    config_json: config_json.clone(),
+                });
+                if let Err(e) = r.send(start).await {
+                    let side = r.side;
+                    self.fail(&remotes, Some(side), e).await;
+                    return;
+                }
+            }
+            let (mut human_reward, mut zombie_reward) = (0.0f32, vec![0.0f32; n]);
 
             let decision_dt = self.cfg.decision_dt();
+            let has_remote = remotes.iter().any(Option::is_some);
             while env.outcome() == Outcome::Running && !self.stopped {
                 if self.paused {
                     match self.rx.recv().await {
@@ -329,40 +554,113 @@ impl MatchTask {
                     }
                     continue;
                 }
-                if self.speed > 0.0 {
-                    let delay = Duration::from_secs_f32(decision_dt / self.speed);
-                    tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
-                        c = self.rx.recv() => {
-                            match c {
-                                Some(c) => self.apply(c),
-                                None => self.stopped = true,
-                            }
-                            continue;
-                        }
-                    }
-                } else {
-                    while let Ok(c) = self.rx.try_recv() {
-                        self.apply(c);
-                    }
-                    tokio::task::yield_now().await;
-                    if self.paused || self.stopped {
-                        continue;
-                    }
+                while let Ok(c) = self.rx.try_recv() {
+                    self.apply(c);
+                }
+                if self.paused || self.stopped {
+                    continue;
                 }
 
-                let (a, za) = match human.act(&env).and_then(|a| Ok((a, zombies.act(&env)?))) {
-                    Ok(actions) => actions,
+                // Phase 1: observations to the remote sides, in-process sides act right away.
+                let tick = env.decisions();
+                for r in remotes.iter_mut().flatten() {
+                    let reward = match r.side {
+                        MatchSide::Human => vec![human_reward],
+                        MatchSide::Zombies => zombie_reward.clone(),
+                    };
+                    if let Err(e) = r.observe(&env, episode, reward).await {
+                        let side = r.side;
+                        self.fail(&remotes, Some(side), e).await;
+                        return;
+                    }
+                }
+                let local = human
+                    .as_mut()
+                    .map(|h| h.act(&env))
+                    .transpose()
+                    .and_then(|a| Ok((a, zombies.as_mut().map(|z| z.act(&env)).transpose()?)));
+                let (local_h, local_z) = match local {
+                    Ok(a) => a,
                     Err(e) => {
-                        tracing::error!("match {}: policy failed: {e}", self.id);
-                        let mut info = self.handle.info.lock().expect("match info lock");
-                        info.status = MatchStatus::Failed;
-                        info.outcome = e;
+                        let err = RemoteError {
+                            reason: format!("policy failed: {e}"),
+                            status: None,
+                        };
+                        self.fail(&remotes, None, err).await;
                         return;
                     }
                 };
+
+                // Phase 2: wait for the remote actions and the throttle together.
+                let delay =
+                    (self.speed > 0.0).then(|| Duration::from_secs_f32(decision_dt / self.speed));
+                let timeout = self.remote.action_timeout;
+                let received = {
+                    let [rh, rz] = &mut remotes;
+                    let wait = async {
+                        let throttle = async {
+                            if let Some(d) = delay {
+                                tokio::time::sleep(d).await;
+                            }
+                        };
+                        let recv_h = async {
+                            match rh.as_mut() {
+                                Some(r) => r.receive(episode, tick, n, timeout).await.map(Some),
+                                None => Ok(None),
+                            }
+                        };
+                        let recv_z = async {
+                            match rz.as_mut() {
+                                Some(r) => r.receive(episode, tick, n, timeout).await.map(Some),
+                                None => Ok(None),
+                            }
+                        };
+                        let (_, h, z) = tokio::join!(throttle, recv_h, recv_z);
+                        (h, z)
+                    };
+                    tokio::pin!(wait);
+                    loop {
+                        tokio::select! {
+                            out = &mut wait => break Some(out),
+                            c = self.rx.recv() => {
+                                match c {
+                                    Some(c) => self.apply(c),
+                                    None => self.stopped = true,
+                                }
+                                if self.stopped {
+                                    break None;
+                                }
+                            }
+                        }
+                    }
+                };
+                let Some((remote_h, remote_z)) = received else {
+                    break;
+                };
+                let remote_h = match remote_h {
+                    Ok(a) => a,
+                    Err(e) => {
+                        self.fail(&remotes, Some(MatchSide::Human), e).await;
+                        return;
+                    }
+                };
+                let remote_z = match remote_z {
+                    Ok(a) => a,
+                    Err(e) => {
+                        self.fail(&remotes, Some(MatchSide::Zombies), e).await;
+                        return;
+                    }
+                };
+                if delay.is_none() && !has_remote {
+                    tokio::task::yield_now().await;
+                }
+                let a = local_h.unwrap_or_else(|| human_action(&remote_h.expect("remote human")));
+                let za = local_z.unwrap_or_else(|| remote_z.expect("remote zombies"));
+
                 actions.push(Replay::encode_step(a, &za));
-                env.step(a, &za);
+                human_reward = env.step(a, &za).human_reward;
+                zombie_reward.clear();
+                zombie_reward.extend_from_slice(env.zombie_rewards());
                 {
                     let mut info = self.handle.info.lock().expect("match info lock");
                     info.tick = env.decisions();
@@ -372,6 +670,7 @@ impl MatchTask {
                 self.publish(frames::snapshot(&env, self.speed, self.paused), false);
             }
 
+            let mut replay_id = String::new();
             if !actions.is_empty() && env.outcome() != Outcome::Running {
                 let replay = Replay {
                     id: format!("{}-e{episode}", self.id),
@@ -382,8 +681,8 @@ impl MatchTask {
                     seed,
                     human: (&self.human).into(),
                     zombies: (&self.zombies).into(),
-                    human_model: self.human.model_id().map(str::to_owned),
-                    zombie_model: self.zombies.model_id().map(str::to_owned),
+                    human_model: self.side_label(MatchSide::Human),
+                    zombie_model: self.side_label(MatchSide::Zombies),
                     actions,
                     outcome: frames::outcome_name(env.outcome()).into(),
                     final_hash: format!("{:016x}", env.state_hash()),
@@ -393,10 +692,32 @@ impl MatchTask {
                 match tokio::task::spawn_blocking(move || store.save(&replay)).await {
                     Ok(Ok(())) => {
                         let mut info = self.handle.info.lock().expect("match info lock");
-                        info.replays.push(id);
+                        info.replays.push(id.clone());
+                        replay_id = id;
                     }
                     Ok(Err(e)) => tracing::error!("failed to save replay {id}: {e}"),
                     Err(e) => tracing::error!("replay save task failed for {id}: {e}"),
+                }
+            }
+            if env.outcome() != Outcome::Running {
+                for r in remotes.iter().flatten() {
+                    let reward = match r.side {
+                        MatchSide::Human => vec![human_reward],
+                        MatchSide::Zombies => zombie_reward.clone(),
+                    };
+                    let end = Msg::End(pb::EpisodeEnd {
+                        episode,
+                        outcome: frames::outcome_name(env.outcome()).into(),
+                        ticks: env.decisions(),
+                        reward,
+                        state_hash: env.state_hash(),
+                        replay_id: replay_id.clone(),
+                    });
+                    if let Err(e) = r.send(end).await {
+                        let side = r.side;
+                        self.fail(&remotes, Some(side), e).await;
+                        return;
+                    }
                 }
             }
 
@@ -411,12 +732,30 @@ impl MatchTask {
             }
             episode += 1;
         }
+        let status = if self.stopped { "stopped" } else { "finished" };
+        self.end_remotes(&remotes, status, "").await;
         let mut info = self.handle.info.lock().expect("match info lock");
         info.status = if self.stopped {
             MatchStatus::Stopped
         } else {
             MatchStatus::Finished
         };
+    }
+
+    /// Model id of a policy side, agent name of a remote side.
+    fn side_label(&self, side: MatchSide) -> Option<String> {
+        let agent = match side {
+            MatchSide::Human => &self.human,
+            MatchSide::Zombies => &self.zombies,
+        };
+        if agent.is_remote() {
+            let info = self.handle.info.lock().expect("match info lock");
+            return match side {
+                MatchSide::Human => info.agent_names.human.clone(),
+                MatchSide::Zombies => info.agent_names.zombies.clone(),
+            };
+        }
+        agent.model_id().map(str::to_owned)
     }
 }
 

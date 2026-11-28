@@ -1,16 +1,20 @@
 //! gRPC agent API (`proto/zai/v1/agent.proto`, docs/ARCHITECTURE.md section 4.9): external
-//! processes play one side of a server match. M7.0 serves `GetInfo`; `CreateMatch` and `Play`
-//! come with the remote sides of M7.1.
+//! processes play one side of a server match (lockstep; realtime lands in M7.3).
 
 use std::pin::Pin;
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
 use zai_sim::env::{INTERACT_ACTIONS, MOVE_ACTIONS};
 use zai_sim::obs::{Block, HUMAN_LAYOUT, ZOMBIE_LAYOUT};
 use zai_sim::{HUMAN_OBS_DIM, OBS_VERSION, ZOMBIE_OBS_DIM};
 
+use crate::api::{self, CreateError};
+use crate::matches::{Agent, MatchRequest};
+use crate::remote::{Conn, MatchSide};
 use crate::AppState;
 
 /// Generated messages and service traits.
@@ -73,19 +77,136 @@ impl pb::agent_service_server::AgentService for AgentApi {
 
     async fn create_match(
         &self,
-        _request: Request<pb::CreateMatchRequest>,
+        request: Request<pb::CreateMatchRequest>,
     ) -> Result<Response<pb::MatchCreated>, Status> {
-        Err(Status::unimplemented("remote sides land in M7.1"))
+        let r = request.into_inner();
+        if r.realtime {
+            return Err(Status::unimplemented("realtime mode lands in M7.3"));
+        }
+        let config = if r.config_json.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&r.config_json)
+                .map_err(|e| Status::invalid_argument(format!("config_json: {e}")))?
+        };
+        let req = MatchRequest {
+            config,
+            seed: r.seed,
+            human: parse_agent(&r.human)?,
+            zombies: parse_agent(&r.zombies)?,
+            deterministic: r.deterministic,
+            speed: r.speed,
+            auto_restart: r.auto_restart,
+        };
+        match api::create(&self.state, req).await {
+            Ok(info) => Ok(Response::new(pb::MatchCreated { match_id: info.id })),
+            Err(e @ CreateError::BadRequest(_)) => Err(Status::invalid_argument(e.message())),
+            Err(e @ CreateError::TooManyRemote(_)) => Err(Status::resource_exhausted(e.message())),
+            Err(e @ CreateError::Internal(_)) => Err(Status::internal(e.message())),
+        }
     }
 
     type PlayStream = ServerStream;
 
     async fn play(
         &self,
-        _request: Request<Streaming<pb::ClientMessage>>,
+        request: Request<Streaming<pb::ClientMessage>>,
     ) -> Result<Response<Self::PlayStream>, Status> {
-        Err(Status::unimplemented("remote sides land in M7.1"))
+        let mut inbound = request.into_inner();
+        let join = match inbound.message().await? {
+            Some(pb::ClientMessage {
+                msg: Some(pb::client_message::Msg::Join(j)),
+            }) => j,
+            _ => return Err(Status::invalid_argument("the first message must be Join")),
+        };
+        let side = MatchSide::from_proto(join.side)
+            .ok_or_else(|| Status::invalid_argument("Join.side must be human or zombies"))?;
+        check_versions(&join, side)?;
+        let handle = self
+            .state
+            .get_match(&join.match_id)
+            .ok_or_else(|| Status::not_found(format!("match {} not found", join.match_id)))?;
+        let sender = handle.join[side.index()]
+            .as_ref()
+            .ok_or_else(|| {
+                Status::already_exists(format!(
+                    "the {} side of match {} is not remote",
+                    side.name(),
+                    join.match_id
+                ))
+            })?
+            .take()
+            .ok_or_else(|| {
+                Status::already_exists(format!(
+                    "the {} side of match {} has already joined",
+                    side.name(),
+                    join.match_id
+                ))
+            })?;
+        let (out_tx, out_rx) = mpsc::channel(16);
+        let (act_tx, act_rx) = mpsc::channel(16);
+        // Forwards the client's actions; dropping `act_tx` tells the match it disconnected.
+        tokio::spawn(async move {
+            while let Ok(Some(m)) = inbound.message().await {
+                if let Some(pb::client_message::Msg::Actions(a)) = m.msg {
+                    if act_tx.send(a).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let conn = Conn {
+            tx: out_tx,
+            actions: act_rx,
+            agent_name: if join.agent_name.is_empty() {
+                format!("remote-{}", side.name())
+            } else {
+                join.agent_name
+            },
+        };
+        sender
+            .send(conn)
+            .map_err(|_| Status::failed_precondition("the match no longer accepts joins"))?;
+        Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
     }
+}
+
+/// `"remote"`, `"scripted"`, `"random"` or `"policy:<model id>"` (empty means scripted).
+fn parse_agent(s: &str) -> Result<Agent, Status> {
+    match s {
+        "" | "scripted" => Ok(Agent::Scripted),
+        "random" => Ok(Agent::Random),
+        "remote" => Ok(Agent::Remote),
+        _ => match s.strip_prefix("policy:") {
+            Some(id) if !id.is_empty() => Ok(Agent::Policy(id.to_owned())),
+            _ => Err(Status::invalid_argument(format!("unknown agent {s:?}"))),
+        },
+    }
+}
+
+/// Refuses a client whose protocol or observation layout differs from this build.
+fn check_versions(join: &pb::Join, side: MatchSide) -> Result<(), Status> {
+    if join.protocol != PROTOCOL_VERSION {
+        return Err(Status::failed_precondition(format!(
+            "protocol {} (client) != {PROTOCOL_VERSION} (server)",
+            join.protocol
+        )));
+    }
+    if join.obs_version != OBS_VERSION {
+        return Err(Status::failed_precondition(format!(
+            "obs_version {} (client) != {OBS_VERSION} (server)",
+            join.obs_version
+        )));
+    }
+    if join.obs_dim as usize != side.obs_dim() {
+        return Err(Status::failed_precondition(format!(
+            "{} obs_dim {} (client) != {} (server)",
+            side.name(),
+            join.obs_dim,
+            side.obs_dim()
+        )));
+    }
+    Ok(())
 }
 
 /// The gRPC service over the shared server state, served next to the HTTP router.

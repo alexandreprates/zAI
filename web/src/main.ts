@@ -291,11 +291,13 @@ async function refreshLists(): Promise<void> {
     $("matches").replaceChildren(
       ...matches.map((m) => {
         const key = `m:${m.id}`;
-        const vs = `${agentName(m.human)} vs ${agentName(m.zombies)}`;
+        const vs = `${m.agent_names.human ?? agentName(m.human)} vs ${
+          m.agent_names.zombies ?? agentName(m.zombies)
+        }`;
         const li = item(m.id, `${m.status} · ep ${m.episode} · ${m.outcome} · ${vs}`, key, () =>
           watch(`/ws/match/${m.id}`, key),
         );
-        if (m.status === "running") {
+        if (m.status === "running" || m.status === "waiting") {
           const stop = document.createElement("button");
           stop.textContent = "Stop";
           stop.className = "small";

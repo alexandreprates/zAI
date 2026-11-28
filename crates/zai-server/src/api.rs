@@ -14,7 +14,7 @@ use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
-use crate::matches::{self, Control, MatchModels, MatchRequest};
+use crate::matches::{self, Control, MatchInfo, MatchModels, MatchRequest};
 use crate::metrics::MetricsPost;
 use crate::policy::Side;
 use crate::{merge_config, unix_now, AppState};
@@ -39,14 +39,41 @@ pub async fn list_matches(State(state): State<Arc<AppState>>) -> Response {
     Json(infos).into_response()
 }
 
-pub async fn create_match(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<MatchRequest>,
-) -> Response {
-    let cfg = match merge_config(&state.base_config, &req.config) {
-        Ok(cfg) => cfg,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e),
-    };
+/// Why a match could not be created.
+pub enum CreateError {
+    /// Invalid config or unknown model.
+    BadRequest(String),
+    /// `ZAI_MAX_REMOTE_MATCHES` matches with a remote side are already live.
+    TooManyRemote(usize),
+    Internal(String),
+}
+
+impl CreateError {
+    pub fn message(&self) -> String {
+        match self {
+            CreateError::BadRequest(e) | CreateError::Internal(e) => e.clone(),
+            CreateError::TooManyRemote(n) => {
+                format!("at most {n} matches with a remote side can run at once")
+            }
+        }
+    }
+}
+
+/// Creates and registers a match (shared by `POST /api/matches` and gRPC `CreateMatch`).
+pub async fn create(state: &Arc<AppState>, req: MatchRequest) -> Result<MatchInfo, CreateError> {
+    let cfg = merge_config(&state.base_config, &req.config).map_err(CreateError::BadRequest)?;
+    if req.human.is_remote() || req.zombies.is_remote() {
+        let live = state
+            .matches
+            .read()
+            .expect("matches lock")
+            .values()
+            .filter(|h| h.is_live_remote())
+            .count();
+        if live >= state.remote.max_matches {
+            return Err(CreateError::TooManyRemote(state.remote.max_matches));
+        }
+    }
     let store = state.models.clone();
     let (human, zombies, zombie_count) = (req.human.clone(), req.zombies.clone(), cfg.zombie_count);
     let loaded = tokio::task::spawn_blocking(move || -> Result<MatchModels, String> {
@@ -64,8 +91,8 @@ pub async fn create_match(
     .await;
     let models = match loaded {
         Ok(Ok(m)) => m,
-        Ok(Err(e)) => return error(StatusCode::BAD_REQUEST, e),
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Ok(Err(e)) => return Err(CreateError::BadRequest(e)),
+        Err(e) => return Err(CreateError::Internal(e.to_string())),
     };
     let id = state.next_match_id();
     let seed = req.seed.unwrap_or_else(crate::random_seed);
@@ -74,9 +101,9 @@ pub async fn create_match(
         cfg,
         &req,
         seed,
-        unix_now(),
         state.replays.clone(),
         models,
+        state.remote,
     );
     let info = handle.info.lock().expect("match info lock").clone();
     state
@@ -84,7 +111,19 @@ pub async fn create_match(
         .write()
         .expect("matches lock")
         .insert(id, handle);
-    (StatusCode::CREATED, Json(info)).into_response()
+    Ok(info)
+}
+
+pub async fn create_match(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<MatchRequest>,
+) -> Response {
+    match create(&state, req).await {
+        Ok(info) => (StatusCode::CREATED, Json(info)).into_response(),
+        Err(e @ CreateError::BadRequest(_)) => error(StatusCode::BAD_REQUEST, e.message()),
+        Err(e @ CreateError::TooManyRemote(_)) => error(StatusCode::TOO_MANY_REQUESTS, e.message()),
+        Err(e @ CreateError::Internal(_)) => error(StatusCode::INTERNAL_SERVER_ERROR, e.message()),
+    }
 }
 
 pub async fn get_match(Path(id): Path<String>, State(state): State<Arc<AppState>>) -> Response {

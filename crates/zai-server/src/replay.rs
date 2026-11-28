@@ -17,6 +17,8 @@ pub enum ReplayAgent {
     Scripted,
     Random,
     Policy,
+    /// A gRPC client (`human_model` / `zombie_model` hold its agent name).
+    Remote,
 }
 
 impl From<&Agent> for ReplayAgent {
@@ -25,6 +27,7 @@ impl From<&Agent> for ReplayAgent {
             Agent::Scripted => Self::Scripted,
             Agent::Random => Self::Random,
             Agent::Policy(_) => Self::Policy,
+            Agent::Remote => Self::Remote,
         }
     }
 }

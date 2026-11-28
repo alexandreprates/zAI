@@ -7,6 +7,7 @@ pub mod leagues;
 pub mod matches;
 pub mod metrics;
 pub mod policy;
+pub mod remote;
 pub mod replay;
 pub mod ws;
 
@@ -27,6 +28,7 @@ use crate::leagues::LeagueStore;
 use crate::matches::MatchHandle;
 use crate::metrics::MetricsStore;
 use crate::policy::ModelStore;
+use crate::remote::RemoteSettings;
 use crate::replay::ReplayStore;
 
 pub struct AppState {
@@ -39,6 +41,8 @@ pub struct AppState {
     pub leagues: LeagueStore,
     pub metrics: MetricsStore,
     pub metrics_tx: broadcast::Sender<String>,
+    /// Timeouts and limits of remote (gRPC) sides.
+    pub remote: RemoteSettings,
     next_id: AtomicU64,
 }
 
@@ -59,6 +63,7 @@ impl AppState {
             leagues,
             metrics,
             metrics_tx,
+            remote: RemoteSettings::default(),
             next_id: AtomicU64::new(1),
         }
     }
