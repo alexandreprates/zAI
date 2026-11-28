@@ -36,6 +36,7 @@ import torch
 import yaml
 
 from arena.export_model import export_training_model
+from arena.export_replays import record_training_replays, training_replay_dir
 from arena.tactics import tactic_metrics
 from zai_env.config import load_config
 from zai_env.layout import OBS_VERSION
@@ -123,6 +124,11 @@ class LeagueConfig:
     eval_every: int = 20  # iterations; anchor evaluation against the scripted bots (0: off)
     eval_episodes: int = 64  # per zombie count
     checkpoint_every: int = 20
+    # At iteration 1 and every `replay_every` iterations (0 disables), record `replay_episodes`
+    # learner-vs-learner episodes on fixed seeds with the stage's largest zombie count, as
+    # viewer replays under `match_id = run_id` (needs `ZAI_DATA_DIR`).
+    replay_every: int = 0
+    replay_episodes: int = 2
     # Curriculum (M6.5): without `stages`, one stage from `stage`, `env_config`,
     # `zombie_counts` and `total_steps`, without a gate.
     stages: list[StageSpec] = field(default_factory=list)
@@ -553,6 +559,26 @@ class League:
                 out[f"anchor/baseline_{k}"] = self.baseline[k]
         return out
 
+    def record_replays(self) -> bool:
+        """Records the current learners against each other as viewer replays."""
+        out_dir = training_replay_dir()
+        if out_dir is None:
+            return False
+        n = max(self.stage.zombie_counts)
+        show_cfg = {**self.env_cfg, "zombie_count": n}
+        dev, human, zomb = self.device, self.human.actor, self.zombie.actor
+        recorded = record_training_replays(
+            out_dir,
+            self.run_id,
+            self.iteration,
+            show_cfg,
+            lambda seed: (RecurrentHumanPolicy(human, 1, dev), "policy"),
+            lambda seed: (RecurrentZombiePolicy(zomb, 1, n, dev), "policy"),
+            self.cfg.replay_episodes,
+        )
+        log.info("replays: %s", ", ".join(f"{r['id']} {r['outcome']}" for r in recorded))
+        return True
+
     def run_probes(self) -> dict[str, float]:
         """Exploitability probes of both sides at the current point (blocking, `arena.probe`)."""
         self.save()
@@ -882,6 +908,10 @@ class League:
                     hs_[f"probe/{side}_gap"] = gap
             if time.time() - t_eval > 1e-3:
                 hs_["perf/eval_s"] = time.time() - t_eval
+            if cfg.replay_every and (self.iteration == 1 or self.iteration % cfg.replay_every == 0):
+                t_replay = time.time()
+                if self.record_replays():
+                    hs_["perf/replay_s"] = time.time() - t_replay
             hlog.log(self.steps, hs_)
             zlog.log(self.steps, zs_)
             log.info(

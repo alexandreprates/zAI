@@ -69,6 +69,8 @@ stages:
 eval_every: 20
 eval_episodes: 128
 checkpoint_every: 20
+replay_every: 25  # learner vs learner replays in the viewer (~3.3 M env steps)
+replay_episodes: 2
 league:
   shares: [0.5, 0.25, 0.25]
   slots: 4

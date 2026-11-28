@@ -178,6 +178,8 @@ def test_tiny_league_trains_snapshots_and_resumes(tiny_cfg, tmp_path, monkeypatc
         "eval_every": 3,
         "eval_episodes": 2,
         "checkpoint_every": 2,
+        "replay_every": 2,
+        "replay_episodes": 1,
         "seeds": [
             {"side": "human", "path": str(starters["human"])},
             {"side": "zombie", "path": str(starters["zombie"])},
@@ -201,6 +203,8 @@ def test_tiny_league_trains_snapshots_and_resumes(tiny_cfg, tmp_path, monkeypatc
     assert len(snaps) == 3, "at the start, after two iterations and at the end of the budget"
     assert (tmp_path / "data" / "leagues" / "lg" / "pool.json").is_file()
     assert (tmp_path / "data" / "models" / "lg-human.onnx").is_file()
+    replays = sorted(p.name for p in (tmp_path / "data" / "replays").iterdir())
+    assert len(replays) == 2 and all(name.startswith("lg-it") for name in replays), replays
     # Resume for one more iteration: the pool state carries over.
     cfg["total_steps"] = 4 * 16 * 8
     cfg_path.write_text(yaml.safe_dump(cfg))
