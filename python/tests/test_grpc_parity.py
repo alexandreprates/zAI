@@ -8,6 +8,7 @@ from zai_env.config import config_dir, load_config
 
 CONFIGS = {
     "s0_small": load_config(config_dir() / "s0_small.yaml", env_overrides=False),
+    "s0": load_config(config_dir() / "s0.yaml", env_overrides=False),
     # The PRD defaults (500 m, 20 zombies) with a short cap.
     "default": load_config(overrides={"episode_cap_s": 40.0}, env_overrides=False),
 }

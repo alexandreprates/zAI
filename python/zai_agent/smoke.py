@@ -19,6 +19,7 @@ def main() -> None:
     args = p.parse_args()
     configs = {
         "s0_small": load_config(config_dir() / "s0_small.yaml", env_overrides=False),
+    "s0": load_config(config_dir() / "s0.yaml", env_overrides=False),
         "default": load_config(overrides={"episode_cap_s": 40.0}, env_overrides=False),
     }
     for name, cfg in configs.items():
