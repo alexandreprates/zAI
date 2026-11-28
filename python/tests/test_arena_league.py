@@ -74,3 +74,24 @@ def test_probe_configs_load_in_the_single_side_trainers(tmp_path):
         path.write_text(yaml.safe_dump(cfg))
         loaded = cls.load(path, {})
         assert loaded.opponent == "policy" and loaded.init_checkpoint.endswith("me.pt")
+
+
+def test_showcase_follows_the_newest_league_snapshots():
+    from arena.showcase import latest
+
+    pool = {
+        "stage": {"starters": {"human": "human-starter", "zombie": "zombie-starter"}},
+        "sides": {
+            "human": [
+                {"id": "human-scripted", "source": "scripted", "path": None, "steps": 0},
+                {"id": "human-starter", "source": "distilled", "path": "s.pt", "steps": 10},
+            ],
+            "zombie": [
+                {"id": "zombie-starter", "source": "distilled", "path": "zs.pt", "steps": 10},
+                {"id": "z0001", "source": "league", "path": "z1.pt", "steps": 100},
+                {"id": "z0002", "source": "league", "path": "z2.pt", "steps": 200},
+            ],
+        },
+    }
+    assert latest(pool, "human")["id"] == "human-starter"
+    assert latest(pool, "zombie")["id"] == "z0002"

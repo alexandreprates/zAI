@@ -27,9 +27,17 @@ type Client = AgentServiceClient<tonic::transport::Channel>;
 /// Serves the agent API on a free port; returns a connected client, the state and the temp
 /// dir (kept alive by the caller).
 async fn serve_with(remote: RemoteSettings) -> (Client, Arc<AppState>, tempfile::TempDir) {
+    serve_full(remote, None).await
+}
+
+async fn serve_full(
+    remote: RemoteSettings,
+    token: Option<&str>,
+) -> (Client, Arc<AppState>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let mut state = AppState::new(Config::default(), dir.path().join("replays"), None);
     state.remote = remote;
+    state.agent_token = token.map(str::to_owned);
     let state = Arc::new(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -195,14 +203,21 @@ async fn get_info_reports_versions_layouts_and_the_base_config() {
 #[tokio::test]
 async fn realtime_and_unknown_agents_are_refused() {
     let (mut client, _dir) = serve().await;
-    let realtime = CreateMatchRequest {
+    let unthrottled = CreateMatchRequest {
         human: "remote".into(),
+        speed: 0.0,
+        realtime: true,
+        ..Default::default()
+    };
+    let err = client.create_match(unthrottled).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    let no_remote = CreateMatchRequest {
         speed: 1.0,
         realtime: true,
         ..Default::default()
     };
-    let err = client.create_match(realtime).await.unwrap_err();
-    assert_eq!(err.code(), Code::Unimplemented);
+    let err = client.create_match(no_remote).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
     let unknown = CreateMatchRequest {
         human: "keyboard".into(),
         ..Default::default()
@@ -429,4 +444,98 @@ async fn invalid_actions_fail_the_match_and_the_remote_cap_holds() {
     assert!(reason.contains("out of range"), "{reason}");
     // The failed match no longer counts against the cap.
     create(&mut client, "remote", "scripted", false).await;
+}
+
+#[tokio::test]
+async fn realtime_repeats_the_last_movement_on_a_missed_deadline() {
+    let (mut client, state, _dir) = serve_with(RemoteSettings::default()).await;
+    let id = client
+        .create_match(CreateMatchRequest {
+            config_json: SMALL.into(),
+            seed: Some(5),
+            human: "remote".into(),
+            zombies: "scripted".into(),
+            speed: 16.0,
+            realtime: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .match_id;
+    let mut h = join(&mut client, &id, Side::Human).await;
+    let Msg::Joined(joined) = h.next().await else {
+        panic!("expected Joined")
+    };
+    assert!(joined.realtime);
+    h.next().await; // EpisodeStart
+                    // Every 10th decision is answered only after the next observation: it misses its deadline
+                    // (31 ms at x16) and arrives late.
+    let (mut late, mut skipped, mut sent) = (None, Vec::new(), Vec::new());
+    let replay_id = loop {
+        match h.next().await {
+            Msg::Obs(o) => {
+                assert!(
+                    o.deadline_ms > 0 && o.deadline_ms <= 32,
+                    "{}",
+                    o.deadline_ms
+                );
+                if let Some((e, t)) = late.take() {
+                    h.act(e, t, vec![3, 1]).await;
+                }
+                let movement = (o.tick % 8) as u8;
+                if o.tick % 10 == 9 {
+                    late = Some((o.episode, o.tick));
+                    skipped.push(o.tick as usize);
+                } else {
+                    h.act(o.episode, o.tick, vec![movement, 0]).await;
+                }
+                sent.push(movement);
+            }
+            Msg::End(e) => break e.replay_id,
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+    wait_status(&state, &id, MatchStatus::Finished).await;
+    let replay = state.replays.load(&replay_id).unwrap();
+    assert!(replay.verify(), "the replay holds the applied actions");
+    assert!(!skipped.is_empty());
+    let on_time = (0..sent.len())
+        .filter(|t| !skipped.contains(t) && replay.actions[*t][0] == sent[*t])
+        .count();
+    assert!(on_time > sent.len() / 2, "most answers met the deadline");
+    for &t in &skipped {
+        // The previous decision is normally the one sent; under load it may itself have been
+        // a fallback, so compare with what was applied.
+        assert_eq!(
+            &replay.actions[t][..2],
+            &[replay.actions[t - 1][0], 0],
+            "tick {t} repeats the last applied movement"
+        );
+    }
+    let info = state.get_match(&id).unwrap().info.lock().unwrap().clone();
+    assert!(info.realtime);
+    assert!(
+        info.late_actions as usize >= skipped.len() - 1,
+        "{}",
+        info.late_actions
+    );
+}
+
+#[tokio::test]
+async fn a_set_token_is_required_on_every_call() {
+    let (mut client, _state, _dir) = serve_full(RemoteSettings::default(), Some("s3cret")).await;
+    let err = client.get_info(GetInfoRequest {}).await.unwrap_err();
+    assert_eq!(err.code(), Code::Unauthenticated);
+    let mut req = tonic::Request::new(GetInfoRequest {});
+    req.metadata_mut()
+        .insert("authorization", "Bearer wrong".parse().unwrap());
+    assert_eq!(
+        client.get_info(req).await.unwrap_err().code(),
+        Code::Unauthenticated
+    );
+    let mut req = tonic::Request::new(GetInfoRequest {});
+    req.metadata_mut()
+        .insert("authorization", "Bearer s3cret".parse().unwrap());
+    assert!(client.get_info(req).await.is_ok());
 }

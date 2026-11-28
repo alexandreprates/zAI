@@ -57,11 +57,14 @@ The viewer and TensorBoard listen on the server. From your machine, tunnel the p
 ssh -N \
   -L 8080:localhost:8080 \
   -L 6006:localhost:6006 \
+  -L 50051:localhost:50051 \
   user@gpu-server
 ```
 
 Then open http://localhost:8080 ("Training runs") and, after `make tensorboard` on the
-server, http://localhost:6006.
+server, http://localhost:6006. Port 50051 is the gRPC agent API (published on the server's
+localhost only): with the tunnel, `python -m zai_agent.play --server localhost:50051 ...` on
+your machine plays checkpoints in a live match.
 
 ## 5. Watch the trained policy play
 
@@ -106,6 +109,18 @@ clients must resolve them to the server's LAN address. Browsers warn until Caddy
 trusted; copy it with `docker compose -f compose.yaml -f compose.tls.yaml cp
 proxy:/data/caddy/pki/authorities/local/root.crt .` and import it into the client's trust store.
 Going back to plain HTTP: `docker compose stop proxy && docker compose up -d server`.
+
+The same Caddy also serves the gRPC agent API over TLS on port 50052 (sites from
+`ZAI_GRPC_TLS_SITES`, default `localhost:50052`, proxied as HTTP/2 to `server:50051`). It is
+published on localhost only; to reach it from the LAN set `ZAI_GRPC_TLS_PUBLISH=50052` and,
+since anyone on the network could then play matches, `ZAI_AGENT_TOKEN`:
+
+```bash
+ZAI_AGENT_TOKEN=... ZAI_GRPC_TLS_PUBLISH=50052 ZAI_GRPC_TLS_SITES="gpu-server.lan:50052" \
+  docker compose -f compose.yaml -f compose.tls.yaml up -d server proxy
+python -m zai_agent.play --server gpu-server.lan:50052 --tls-root root.crt --token ... \
+  --human scripted --zombies scripted
+```
 
 ## What to check in the first hour
 

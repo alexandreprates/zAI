@@ -15,8 +15,12 @@ services:
     depends_on: [server]
     ports:
       - "8080:8080"
+      # gRPC over TLS (Caddy site of ZAI_GRPC_TLS_SITES, h2c to server:50051). Local only by
+      # default; set ZAI_GRPC_TLS_PUBLISH=50052 (all interfaces) together with ZAI_AGENT_TOKEN.
+      - "${ZAI_GRPC_TLS_PUBLISH:-127.0.0.1:50052}:50052"
     environment:
       ZAI_TLS_SITES: ${ZAI_TLS_SITES:-localhost:8080}
+      ZAI_GRPC_TLS_SITES: ${ZAI_GRPC_TLS_SITES:-localhost:50052}
     volumes:
       - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

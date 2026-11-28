@@ -43,6 +43,8 @@ pub struct AppState {
     pub metrics_tx: broadcast::Sender<String>,
     /// Timeouts and limits of remote (gRPC) sides.
     pub remote: RemoteSettings,
+    /// `ZAI_AGENT_TOKEN`: bearer token required on every gRPC call when set.
+    pub agent_token: Option<String>,
     next_id: AtomicU64,
 }
 
@@ -64,6 +66,7 @@ impl AppState {
             metrics,
             metrics_tx,
             remote: RemoteSettings::default(),
+            agent_token: None,
             next_id: AtomicU64::new(1),
         }
     }

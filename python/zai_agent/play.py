@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 from pathlib import Path
 
 from zai_env.config import load_config
@@ -35,7 +36,7 @@ def _name(spec: str) -> str:
 
 
 async def run(args: argparse.Namespace) -> None:
-    async with Client(args.server) as client:
+    async with Client(args.server, args.token, args.tls_root) as client:
         info = await client.info()
         check(info)
         log.info("server %s, protocol %d, obs v%d", info.version, info.protocol, info.obs_version)
@@ -62,6 +63,7 @@ async def run(args: argparse.Namespace) -> None:
                     zombies=agents["zombies"],
                     speed=args.speed,
                     deterministic=args.deterministic,
+                    realtime=args.realtime,
                 )
                 log.info("match %s: %s vs %s", match_id, sides["human"], sides["zombies"])
             results = await asyncio.gather(
@@ -83,7 +85,10 @@ async def run(args: argparse.Namespace) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--server", default="server:50051")
+    p.add_argument("--server", default=os.environ.get("ZAI_GRPC_TARGET", "server:50051"))
+    p.add_argument("--token", default=os.environ.get("ZAI_AGENT_TOKEN") or None)
+    p.add_argument("--tls-root", help="PEM root certificate (TLS, e.g. through Caddy)")
+    p.add_argument("--realtime", action="store_true", help="deadlines of one decision")
     p.add_argument("--human", help="checkpoint .pt, scripted, random or server:<agent>")
     p.add_argument("--zombies", help="checkpoint .pt, scripted, random or server:<agent>")
     p.add_argument("--match", help="join this existing match instead of creating one")

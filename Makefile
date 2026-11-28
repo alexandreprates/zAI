@@ -9,7 +9,7 @@ unexport DOCKER_DEFAULT_PLATFORM
 DEV := docker compose run --rm -T dev
 GPU := docker compose -f compose.yaml -f compose.gpu.yaml
 
-.PHONY: test lint fmt proto shell build up play play-gpu train-league train-league-gpu arena-gpu probe-gpu distill-gpu export-model export-model-gpu train-human train-human-gpu tensorboard web-install web-dev check-gpu ci-test ci-lint ci-proto ci-proto-check ci-fmt ci-py-develop ci-web-install
+.PHONY: test lint fmt proto shell build up play play-gpu showcase grpc-smoke train-league train-league-gpu arena-gpu probe-gpu distill-gpu export-model export-model-gpu train-human train-human-gpu tensorboard web-install web-dev check-gpu ci-test ci-lint ci-proto ci-proto-check ci-fmt ci-py-develop ci-web-install
 
 test: ## Run Rust and Python tests
 	$(DEV) make ci-test
@@ -64,6 +64,12 @@ play: ## Play checkpoints or bots in a live server match over gRPC (zai_agent.pl
 
 play-gpu: ## On the GPU server: make play with the cu126 trainer image, CPU-only
 	$(GPU) --profile train run --rm --build -e CUDA_VISIBLE_DEVICES= trainer python -m zai_agent.play --server server:50051 $(ARGS)
+
+showcase: ## Live match of the latest league snapshots over gRPC (arena container); ARGS="--run-id ID"
+	docker compose --profile arena run --rm arena python -m arena.showcase $(ARGS)
+
+grpc-smoke: ## gRPC parity smoke test from the arena container against the running server container
+	docker compose --profile arena run --rm arena python -m zai_agent.smoke $(ARGS)
 
 probe-gpu: ## On the GPU server: exploitability probe of a league; ARGS="--run-id ID --side both --steps 10000000"
 	$(GPU) --profile train run --rm --build trainer python -m arena.probe $(ARGS)

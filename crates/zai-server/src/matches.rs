@@ -109,6 +109,10 @@ pub struct MatchRequest {
     /// Start a new episode (next seed) whenever one ends.
     #[serde(default)]
     pub auto_restart: bool,
+    /// Remote sides get a deadline of one decision at the current speed; a side that misses
+    /// it repeats its last movement. Needs a remote side and `speed > 0`.
+    #[serde(default)]
+    pub realtime: bool,
 }
 
 fn scripted() -> Agent {
@@ -172,6 +176,7 @@ pub struct MatchInfo {
     pub human: Agent,
     pub zombies: Agent,
     pub deterministic: bool,
+    pub realtime: bool,
     pub base_seed: u64,
     pub seed: u64,
     pub episode: u32,
@@ -262,6 +267,7 @@ pub fn start(
         human: req.human.clone(),
         zombies: req.zombies.clone(),
         deterministic: req.deterministic,
+        realtime: req.realtime,
         base_seed,
         seed: env.seed(),
         episode: 0,
@@ -302,6 +308,7 @@ pub fn start(
         human: req.human.clone(),
         zombies: req.zombies.clone(),
         deterministic: req.deterministic,
+        realtime: req.realtime,
         models,
         speed,
         paused: false,
@@ -323,6 +330,7 @@ struct MatchTask {
     human: Agent,
     zombies: Agent,
     deterministic: bool,
+    realtime: bool,
     models: MatchModels,
     speed: f32,
     paused: bool,
@@ -336,6 +344,26 @@ struct MatchTask {
 
 /// Remote sides of a running match, indexed by `MatchSide::index`.
 type Remotes = [Option<RemoteSide>; 2];
+
+/// The actions of one remote side for `(episode, tick)`: by `deadline` in realtime mode,
+/// within `timeout` in lockstep; `None` for an in-process side.
+async fn receive(
+    side: Option<&mut RemoteSide>,
+    episode: u32,
+    tick: u32,
+    num_zombies: usize,
+    deadline: Option<tokio::time::Instant>,
+    timeout: Duration,
+) -> Result<Option<Vec<u8>>, RemoteError> {
+    match (side, deadline) {
+        (Some(r), Some(d)) => r.receive_by(episode, tick, num_zombies, d).await.map(Some),
+        (Some(r), None) => r
+            .receive(episode, tick, num_zombies, timeout)
+            .await
+            .map(Some),
+        (None, _) => Ok(None),
+    }
+}
 
 impl MatchTask {
     /// In-process drivers of one episode; `None` for remote sides.
@@ -456,7 +484,7 @@ impl MatchTask {
             let joined = Msg::Joined(pb::Joined {
                 match_id: self.id.clone(),
                 side: side.proto() as i32,
-                realtime: false,
+                realtime: self.realtime,
                 decision_dt: self.cfg.decision_dt(),
             });
             if let Err(e) = r.send(joined).await {
@@ -522,6 +550,9 @@ impl MatchTask {
             self.publish(frames::init(&env, "live", &self.id, episode, None), true);
             self.publish(frames::snapshot(&env, self.speed, self.paused), false);
             let n = env.zombies().len();
+            for r in remotes.iter_mut().flatten() {
+                r.start_episode(n);
+            }
             for r in remotes.iter().flatten() {
                 let start = Msg::Start(pb::EpisodeStart {
                     episode,
@@ -563,12 +594,21 @@ impl MatchTask {
 
                 // Phase 1: observations to the remote sides, in-process sides act right away.
                 let tick = env.decisions();
+                let delay =
+                    (self.speed > 0.0).then(|| Duration::from_secs_f32(decision_dt / self.speed));
+                // Realtime: answer within one decision at the current speed.
+                let deadline = delay
+                    .filter(|_| self.realtime)
+                    .map(|d| tokio::time::Instant::now() + d);
+                let deadline_ms = delay
+                    .filter(|_| self.realtime)
+                    .map_or(0, |d| d.as_millis().max(1) as u32);
                 for r in remotes.iter_mut().flatten() {
                     let reward = match r.side {
                         MatchSide::Human => vec![human_reward],
                         MatchSide::Zombies => zombie_reward.clone(),
                     };
-                    if let Err(e) = r.observe(&env, episode, reward).await {
+                    if let Err(e) = r.observe(&env, episode, reward, deadline_ms).await {
                         let side = r.side;
                         self.fail(&remotes, Some(side), e).await;
                         return;
@@ -592,8 +632,6 @@ impl MatchTask {
                 };
 
                 // Phase 2: wait for the remote actions and the throttle together.
-                let delay =
-                    (self.speed > 0.0).then(|| Duration::from_secs_f32(decision_dt / self.speed));
                 let timeout = self.remote.action_timeout;
                 let received = {
                     let [rh, rz] = &mut remotes;
@@ -603,18 +641,8 @@ impl MatchTask {
                                 tokio::time::sleep(d).await;
                             }
                         };
-                        let recv_h = async {
-                            match rh.as_mut() {
-                                Some(r) => r.receive(episode, tick, n, timeout).await.map(Some),
-                                None => Ok(None),
-                            }
-                        };
-                        let recv_z = async {
-                            match rz.as_mut() {
-                                Some(r) => r.receive(episode, tick, n, timeout).await.map(Some),
-                                None => Ok(None),
-                            }
-                        };
+                        let recv_h = receive(rh.as_mut(), episode, tick, n, deadline, timeout);
+                        let recv_z = receive(rz.as_mut(), episode, tick, n, deadline, timeout);
                         let (_, h, z) = tokio::join!(throttle, recv_h, recv_z);
                         (h, z)
                     };
@@ -666,6 +694,7 @@ impl MatchTask {
                     info.tick = env.decisions();
                     info.time = env.time();
                     info.outcome = frames::outcome_name(env.outcome()).into();
+                    info.late_actions = remotes.iter().flatten().map(|r| r.late).sum();
                 }
                 self.publish(frames::snapshot(&env, self.speed, self.paused), false);
             }

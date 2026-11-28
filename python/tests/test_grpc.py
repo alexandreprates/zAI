@@ -87,3 +87,18 @@ def test_a_refused_join_raises_and_a_failed_match_reports(zai_server):
                 await client.play(mid, "human", lambda c, n: Broken())
 
     asyncio.run(run())
+
+
+def test_python_client_sends_the_realtime_flag(zai_server):
+    async def run():
+        async with Client(zai_server[0]) as client:
+            with pytest.raises(grpc.aio.AioRpcError) as err:
+                await client.create_match(config=SMALL, realtime=True, speed=0.0)
+            assert err.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+            mid = await client.create_match(
+                config=SMALL, zombies="scripted", speed=16.0, realtime=True
+            )
+            return await client.play(mid, "human", human_policy("scripted"))
+
+    episodes = asyncio.run(run())
+    assert len(episodes) == 1 and episodes[0].replay_id

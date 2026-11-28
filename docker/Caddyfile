@@ -15,3 +15,10 @@
 		flush_interval -1
 	}
 }
+
+# gRPC agent API over TLS (ZAI_GRPC_TLS_SITES, host:50052 list): HTTP/2 to the server's
+# plaintext listener. Clients pass the root certificate (`zai_agent.play --tls-root`).
+{$ZAI_GRPC_TLS_SITES:localhost:50052} {
+	tls internal
+	reverse_proxy h2c://server:50051
+}

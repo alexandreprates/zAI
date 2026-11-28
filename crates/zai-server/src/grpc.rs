@@ -80,9 +80,6 @@ impl pb::agent_service_server::AgentService for AgentApi {
         request: Request<pb::CreateMatchRequest>,
     ) -> Result<Response<pb::MatchCreated>, Status> {
         let r = request.into_inner();
-        if r.realtime {
-            return Err(Status::unimplemented("realtime mode lands in M7.3"));
-        }
         let config = if r.config_json.trim().is_empty() {
             serde_json::Value::Null
         } else {
@@ -97,6 +94,7 @@ impl pb::agent_service_server::AgentService for AgentApi {
             deterministic: r.deterministic,
             speed: r.speed,
             auto_restart: r.auto_restart,
+            realtime: r.realtime,
         };
         match api::create(&self.state, req).await {
             Ok(info) => Ok(Response::new(pb::MatchCreated { match_id: info.id })),
@@ -209,7 +207,32 @@ fn check_versions(join: &pb::Join, side: MatchSide) -> Result<(), Status> {
     Ok(())
 }
 
+/// Requires `authorization: Bearer <ZAI_AGENT_TOKEN>` on every call when a token is set.
+#[derive(Clone)]
+pub struct TokenCheck(Option<Arc<str>>);
+
+impl tonic::service::Interceptor for TokenCheck {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        let Some(token) = &self.0 else {
+            return Ok(request);
+        };
+        let given = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        match given {
+            Some(t) if t.as_bytes() == token.as_bytes() => Ok(request),
+            _ => Err(Status::unauthenticated("missing or wrong agent token")),
+        }
+    }
+}
+
+pub type AgentServer =
+    tonic::service::interceptor::InterceptedService<AgentServiceServer<AgentApi>, TokenCheck>;
+
 /// The gRPC service over the shared server state, served next to the HTTP router.
-pub fn grpc_service(state: Arc<AppState>) -> AgentServiceServer<AgentApi> {
-    AgentServiceServer::new(AgentApi { state })
+pub fn grpc_service(state: Arc<AppState>) -> AgentServer {
+    let token = TokenCheck(state.agent_token.as_deref().map(Arc::from));
+    AgentServiceServer::with_interceptor(AgentApi { state }, token)
 }

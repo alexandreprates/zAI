@@ -75,6 +75,8 @@ export interface MatchInfo {
   human: Agent;
   zombies: Agent;
   deterministic: boolean;
+  /** Remote sides get a deadline of one decision; misses repeat the last movement. */
+  realtime: boolean;
   episode: number;
   tick: number;
   time: number;

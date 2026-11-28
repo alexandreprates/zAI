@@ -62,7 +62,13 @@ impl CreateError {
 /// Creates and registers a match (shared by `POST /api/matches` and gRPC `CreateMatch`).
 pub async fn create(state: &Arc<AppState>, req: MatchRequest) -> Result<MatchInfo, CreateError> {
     let cfg = merge_config(&state.base_config, &req.config).map_err(CreateError::BadRequest)?;
-    if req.human.is_remote() || req.zombies.is_remote() {
+    let remote = req.human.is_remote() || req.zombies.is_remote();
+    if req.realtime && !(remote && matches::clamp_speed(req.speed) > 0.0) {
+        return Err(CreateError::BadRequest(
+            "realtime needs a remote side and speed > 0".into(),
+        ));
+    }
+    if remote {
         let live = state
             .matches
             .read()

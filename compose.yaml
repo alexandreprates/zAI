@@ -21,6 +21,9 @@ services:
       # Agent API (gRPC): local only, reach it from another machine through an SSH tunnel
       # (docs/ARCHITECTURE.md 4.9, decision E10).
       - "127.0.0.1:50051:50051"
+    environment:
+      # Optional bearer token required on every gRPC call (empty: none).
+      ZAI_AGENT_TOKEN: ${ZAI_AGENT_TOKEN:-}
     volumes:
       - data:/data
 
@@ -46,6 +49,22 @@ services:
       # Server data: arena.export_replays writes policy replays into /data/replays.
       - data:/data
     profiles: ["train"]
+
+  # Remote gRPC agents (docs/ARCHITECTURE.md 4.9.4): `make showcase`, `make play`, `make
+  # grpc-smoke`. Reuses whichever trainer image exists (CPU, or cu126 on the GPU server, run
+  # without the GPU) and is capped at 2 CPUs so it cannot starve a league next to it.
+  arena:
+    image: zai-trainer
+    cpus: 2
+    environment:
+      CUDA_VISIBLE_DEVICES: ""
+      ZAI_GRPC_TARGET: server:50051
+      ZAI_SERVER_URL: http://server:8080
+      ZAI_CHECKPOINT_DIR: /checkpoints
+      ZAI_AGENT_TOKEN: ${ZAI_AGENT_TOKEN:-}
+    volumes:
+      - checkpoints:/checkpoints:ro
+    profiles: ["arena"]
 
   tensorboard:
     image: zai-trainer

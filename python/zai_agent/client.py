@@ -90,16 +90,34 @@ class MatchFailed(RuntimeError):
 
 
 class Client:
-    """Connection to a server's agent API, e.g. `async with Client("server:50051") as c`."""
+    """Connection to a server's agent API, e.g. `async with Client("server:50051") as c`.
 
-    def __init__(self, target: str, timeout_s: float = 10.0):
+    `token` is sent as `authorization: Bearer <token>` (the server's `ZAI_AGENT_TOKEN`);
+    `tls_root` (a PEM file, e.g. Caddy's local root certificate) switches to TLS, for the
+    Caddy gRPC site of `compose.tls.yaml`."""
+
+    def __init__(
+        self,
+        target: str,
+        token: str | None = None,
+        tls_root: str | None = None,
+        timeout_s: float = 10.0,
+    ):
         self.target = target
         self.timeout_s = timeout_s
-        self._channel = grpc.aio.insecure_channel(target)
+        if tls_root:
+            with open(tls_root, "rb") as f:
+                creds = grpc.ssl_channel_credentials(root_certificates=f.read())
+            self._channel = grpc.aio.secure_channel(target, creds)
+        else:
+            self._channel = grpc.aio.insecure_channel(target)
+        self._metadata = (("authorization", f"Bearer {token}"),) if token else None
         self._stub = agent_pb2_grpc.AgentServiceStub(self._channel)
 
     async def info(self) -> ServerInfo:
-        r = await self._stub.GetInfo(agent_pb2.GetInfoRequest(), timeout=self.timeout_s)
+        r = await self._stub.GetInfo(
+            agent_pb2.GetInfoRequest(), timeout=self.timeout_s, metadata=self._metadata
+        )
         return ServerInfo(
             version=r.version,
             protocol=r.protocol,
@@ -118,6 +136,7 @@ class Client:
         speed: float = 0.0,
         auto_restart: bool = False,
         deterministic: bool = False,
+        realtime: bool = False,
     ) -> str:
         """Creates a match; sides are `remote`, `scripted`, `random` or `policy:<model id>`."""
         req = agent_pb2.CreateMatchRequest(
@@ -127,10 +146,11 @@ class Client:
             speed=speed,
             auto_restart=auto_restart,
             deterministic=deterministic,
+            realtime=realtime,
         )
         if seed is not None:
             req.seed = seed
-        r = await self._stub.CreateMatch(req, timeout=self.timeout_s)
+        r = await self._stub.CreateMatch(req, timeout=self.timeout_s, metadata=self._metadata)
         return r.match_id
 
     async def play(
@@ -162,7 +182,7 @@ class Client:
             while (msg := await outgoing.get()) is not None:
                 yield msg
 
-        call = self._stub.Play(requests())
+        call = self._stub.Play(requests(), metadata=self._metadata)
         policy, config, episodes, ticks = None, {}, [], []
         start = None
         try:

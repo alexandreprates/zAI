@@ -4,7 +4,8 @@
 //! `0.0.0.0:50051`), `ZAI_DATA_DIR` (default `./data`,
 //! holds `replays/` and `metrics.db`), `ZAI_WEB_DIR` (built viewer, optional),
 //! `ZAI_ZOMBIE_COUNT` / `ZAI_FOOD_COUNT` (base config overrides), `ZAI_REMOTE_JOIN_TIMEOUT_S` /
-//! `ZAI_REMOTE_TIMEOUT_S` / `ZAI_MAX_REMOTE_MATCHES` (remote sides), `RUST_LOG`.
+//! `ZAI_REMOTE_TIMEOUT_S` / `ZAI_MAX_REMOTE_MATCHES` (remote sides), `ZAI_AGENT_TOKEN`
+//! (required on gRPC calls when set), `RUST_LOG`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,6 +44,9 @@ async fn main() {
         Some(data_dir.join("metrics.db")),
     );
     state.remote = zai_server::remote::RemoteSettings::from_env();
+    state.agent_token = std::env::var("ZAI_AGENT_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
     let state = Arc::new(state);
 
     let addr = std::env::var("ZAI_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());

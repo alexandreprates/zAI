@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
-use zai_sim::env::{INTERACT_ACTIONS, MOVE_ACTIONS};
+use zai_sim::env::{INTERACT_ACTIONS, INTERACT_NONE, MOVE_ACTIONS, STAY};
 use zai_sim::obs::{write_human_obs, write_zombie_obs};
 use zai_sim::{Env, HumanAction, HUMAN_OBS_DIM, ZOMBIE_OBS_DIM};
 
@@ -152,6 +152,10 @@ pub struct RemoteSide {
     pub side: MatchSide,
     pub conn: Conn,
     obs: Vec<f32>,
+    /// Last applied actions (realtime fallback): human `[movement, interact]`, zombies `[N]`.
+    last: Vec<u8>,
+    /// Realtime: actions that arrived after their deadline.
+    pub late: u32,
 }
 
 impl RemoteSide {
@@ -160,6 +164,60 @@ impl RemoteSide {
             side,
             conn,
             obs: Vec::new(),
+            last: Vec::new(),
+            late: 0,
+        }
+    }
+
+    /// Starts an episode: the realtime fallback becomes "stay, no interaction".
+    pub fn start_episode(&mut self, num_zombies: usize) {
+        self.last = match self.side {
+            MatchSide::Human => vec![STAY, INTERACT_NONE],
+            MatchSide::Zombies => vec![STAY; num_zombies],
+        };
+    }
+
+    /// The fallback of a missed deadline: the last applied movement, no interaction.
+    fn fallback(&self) -> Vec<u8> {
+        match self.side {
+            MatchSide::Human => vec![self.last[0], INTERACT_NONE],
+            MatchSide::Zombies => self.last.clone(),
+        }
+    }
+
+    /// Realtime: the actions of `(episode, tick)` if they arrive before `deadline`, else the
+    /// fallback. Actions for an older tick arrived late: they are dropped and counted.
+    pub async fn receive_by(
+        &mut self,
+        episode: u32,
+        tick: u32,
+        num_zombies: usize,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<u8>, RemoteError> {
+        let name = self.side.name();
+        loop {
+            let a = match tokio::time::timeout_at(deadline, self.conn.actions.recv()).await {
+                Err(_) => {
+                    let a = self.fallback();
+                    self.last.clone_from(&a);
+                    return Ok(a);
+                }
+                Ok(None) => return Err(RemoteError::gone(format!("remote {name} disconnected"))),
+                Ok(Some(a)) => a,
+            };
+            if (a.episode, a.tick) < (episode, tick) {
+                self.late += 1;
+                continue;
+            }
+            if (a.episode, a.tick) > (episode, tick) {
+                return Err(invalid(format!(
+                    "remote {name}: actions for episode {} tick {} before the observation",
+                    a.episode, a.tick
+                )));
+            }
+            validate(self.side, &a.actions, num_zombies).map_err(invalid)?;
+            self.last.clone_from(&a.actions);
+            return Ok(a.actions);
         }
     }
 
@@ -178,6 +236,7 @@ impl RemoteSide {
         env: &Env,
         episode: u32,
         reward: Vec<f32>,
+        deadline_ms: u32,
     ) -> Result<(), RemoteError> {
         let dim = self.side.obs_dim();
         let (n, mask) = match self.side {
@@ -207,7 +266,7 @@ impl RemoteSide {
             reward,
             state_hash: env.state_hash(),
             time: env.time(),
-            deadline_ms: 0,
+            deadline_ms,
         }))
         .await
     }
