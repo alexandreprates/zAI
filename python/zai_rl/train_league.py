@@ -63,7 +63,9 @@ log = logging.getLogger("zai_rl.train_league")
 class LeagueParams:
     shares: tuple[float, float, float] = (0.5, 0.25, 0.25)  # groups A, B, C
     slots: int = 4  # resident opponent slots per side, slot 0 is the scripted bot
-    scripted_share: float = 0.2
+    # Share of a learner's B/C episodes against the other side's scripted bot: one value for
+    # both learners or a mapping by learner side, e.g. {human: 0.2, zombie: 0.0} (section 4.8.9).
+    scripted_share: float | dict[str, float] = 0.2
     lease_iters: int = 5
     snapshot_every_steps: int = 10_000_000
     pool_cap: int = 50
@@ -78,6 +80,12 @@ class LeagueParams:
     # scale: the winning side updates at half the lr; freeze: it skips its updates while the
     # guard is engaged (docs/ARCHITECTURE.md section 4.8.9). The losing side gets +1 epoch.
     guard_mode: str = "scale"
+
+    def scripted_for(self, learner: str) -> float:
+        """Scripted share of `learner`'s opponent episodes."""
+        s = self.scripted_share
+        return float(s[learner]) if isinstance(s, dict) else float(s)
+
     starvation_alarm: float = 0.5
 
 
@@ -163,6 +171,9 @@ class LeagueConfig:
             raise ValueError(f"unknown league.* keys: {sorted(bad)}")
         if lg.get("guard_mode", "scale") not in ("scale", "freeze"):
             raise ValueError("league.guard_mode must be 'scale' or 'freeze'")
+        share = lg.get("scripted_share")
+        if isinstance(share, dict) and set(share) != {"human", "zombie"}:
+            raise ValueError("league.scripted_share as a mapping needs keys human and zombie")
         groups = league_groups(
             raw.get("num_envs", 1024),
             raw.get("zombie_counts", [3, 6, 9]),
@@ -725,7 +736,7 @@ class League:
             dev,
             self.rng,
             p.slots,
-            p.scripted_share,
+            p.scripted_for("human"),  # zombie opponents of the human learner
             p.lease_iters,
             cfg.seed + 101,
             graph=cfg.cuda_graphs,
@@ -737,7 +748,7 @@ class League:
             dev,
             self.rng,
             p.slots,
-            p.scripted_share,
+            p.scripted_for("zombie"),  # human opponents of the zombie learner
             p.lease_iters,
             cfg.seed + 202,
             graph=cfg.cuda_graphs,
