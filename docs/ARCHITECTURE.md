@@ -671,6 +671,188 @@ Accepted by the user on 2026-11-27: the recommended option of each row below (D1
 | D8 | S1 definition | (a) 300 m, 6 houses, 45 food, 75 m spawn, 10 min, counts 8/12/16; (b) section 4.4 as written (30 food, 4-8 zombies) | (a) |
 | D9 | v1 ONNX models in `data/models/` | (a) move to `data/models/legacy/` (not listed); (b) delete; (c) keep (the server rejects them on `obs_dim` and logs it) | (a) |
 
+### 4.9 M7 plan: gRPC agents and first-person view
+
+Status: accepted by the user on 2026-11-28 (the recommended option of every row in 4.9.10, E1-E13 all (a)); implemented on branch `m7` in the order M7.0-M7.5. M7 runs in parallel with M6, which stays open (zombie-balance runs on the GPU, 4.8.9); every M7 sub-milestone is CPU-only and runs on the pilot or the GPU server's CPU without touching the GPU. Six sub-milestones, each runnable and testable on its own: **M7.0** protocol, code generation and `GetInfo`; **M7.1** remote sides in the server's match loop (lockstep); **M7.2** `zai_agent` Python client, `make play` and the observation parity test; **M7.3** realtime mode, exposure (token, TLS), CPU `arena` container and the league showcase; **M7.4** first-person mode of the 3D view with per-snapshot visibility; **M7.5** acceptance run and docs. M7.4 does not depend on M7.0-M7.3 and can be done first or in parallel. The sketch in section 5.2 predates M3-M6 and is superseded by 4.9.2-4.9.3.
+
+#### 4.9.1 What gRPC is for now that the server runs ONNX
+
+Since M3/M6 the server plays trained models in-process (`policy.rs`, tract, ONNX exported by `arena.export_model`), so viewer matches need no external process. gRPC adds a fourth side type, **remote**, for what the in-process path cannot do:
+- **PyTorch checkpoints without export:** league pool snapshots (`pool/{human,zombie}/*.pt` are actor-only and never exported), any `latest.pt` / `itNNNNNN.pt`, and **v1 checkpoints** through `zai_env.legacy.adapt_v1_*` on the client (ONNX export refuses v1; the server rejects v1 models).
+- **The PRD requirement** that both models communicate with the game server (section 7 #17), demonstrated by the arena container driving live matches.
+- **Future agents** in other languages or processes (a keyboard client through a bridge, a JAX policy), against the same contract: raw f32 observation bytes written by `zai_sim::obs`, layout and version announced by the server.
+
+In-process ONNX stays the default for viewer matches and the New match form (`make up` alone keeps working). Training and the Elo arena stay in-process (`VecEnv`), because gRPC is 15-40x slower for batched evaluation (4.9.4).
+
+#### 4.9.2 Protocol (`proto/zai/v1/agent.proto`)
+
+```proto
+syntax = "proto3";
+package zai.v1;
+
+service AgentService {
+  rpc GetInfo(GetInfoRequest) returns (ServerInfo);           // versions, layouts, action dims
+  rpc CreateMatch(CreateMatchRequest) returns (MatchCreated); // same semantics as POST /api/matches
+  rpc Play(stream ClientMessage) returns (stream ServerMessage); // one stream per (match, side)
+}
+
+enum Side { SIDE_UNSPECIFIED = 0; SIDE_HUMAN = 1; SIDE_ZOMBIES = 2; }
+
+message GetInfoRequest {}
+message LayoutBlock { string name = 1; uint32 start = 2; uint32 len = 3; }
+message SideSpec {
+  uint32 obs_dim = 1;                  // HUMAN_OBS_DIM / ZOMBIE_OBS_DIM of this build
+  repeated LayoutBlock blocks = 2;     // from HUMAN_LAYOUT / ZOMBIE_LAYOUT (obs.rs)
+  repeated uint32 action_dims = 3;     // human [17, 3], zombie [17] (MOVE_ACTIONS, INTERACT_ACTIONS)
+}
+message ServerInfo {
+  string version = 1;                  // zai_sim::VERSION
+  uint32 protocol = 2;                 // 1
+  uint32 obs_version = 3;              // OBS_VERSION
+  SideSpec human = 4;
+  SideSpec zombie = 5;
+  string base_config_json = 6;         // server base config after env overrides
+}
+
+message CreateMatchRequest {
+  string config_json = 1;              // partial config merged over the base (Rust validates)
+  optional uint64 seed = 2;
+  string human = 3;                    // "remote" | "scripted" | "random" | "policy:<model id>"
+  string zombies = 4;
+  float speed = 5;                     // 0 = unthrottled (proto default), else x0.25-x16
+  bool auto_restart = 6;
+  bool realtime = 7;                   // only with remote sides and speed > 0 (4.9.3)
+  bool deterministic = 8;              // in-process policy sides only
+}
+message MatchCreated { string match_id = 1; }
+
+message ClientMessage { oneof msg { Join join = 1; Actions actions = 2; } }
+message Join {
+  string match_id = 1; Side side = 2;
+  uint32 protocol = 3; uint32 obs_version = 4; uint32 obs_dim = 5;  // refused on mismatch
+  string agent_name = 6;               // stored in MatchInfo and replays, e.g. "league-x/h0003"
+}
+message Actions {
+  uint32 episode = 1; uint32 tick = 2;
+  bytes actions = 3;                   // u8: human [movement, interact], zombies [N]
+}
+
+message ServerMessage {
+  oneof msg { Joined joined = 1; EpisodeStart start = 2; Observation obs = 3;
+              EpisodeEnd end = 4; MatchEnd match_end = 5; }
+}
+message Joined { string match_id = 1; Side side = 2; bool realtime = 3; float decision_dt = 4; }
+message EpisodeStart { uint32 episode = 1; uint64 seed = 2; uint32 num_agents = 3; string config_json = 4; }
+message Observation {
+  uint32 episode = 1; uint32 tick = 2; uint32 num_agents = 3; uint32 obs_dim = 4;
+  bytes obs = 5;                       // little-endian f32 [num_agents, obs_dim]
+  bytes mask = 6;                      // human: 20 x u8 (17 move + 3 interact); zombies: empty
+  repeated float reward = 7;           // per agent, of the step that led here (0 at tick 0)
+  uint64 state_hash = 8;               // Env::state_hash after that step (parity, desync debugging)
+  float time = 9;
+  uint32 deadline_ms = 10;             // realtime only: time left to answer; 0 in lockstep
+}
+message EpisodeEnd {
+  uint32 episode = 1; string outcome = 2; uint32 ticks = 3;
+  repeated float reward = 4; uint64 state_hash = 5; string replay_id = 6;
+}
+message MatchEnd { string status = 1; string reason = 2; }  // finished | stopped | failed
+```
+
+- Nothing in the protocol hardcodes a dimension: clients read `obs_dim`, `blocks` and `action_dims` from `GetInfo`, and `Join` carries the client's `protocol`, `obs_version` and `obs_dim`. A mismatch is refused with `FAILED_PRECONDITION` (message names both versions) before the first observation, so a layout v3 from M6 (zombie observation) changes no proto field.
+- `EpisodeStart.config_json` is the effective config (`serde_json` of `env.config()`, f32 values round-trip exactly), so a client can rebuild the same `zai_sim.Env` and the v1 adapter gets its map size.
+- Sizes per decision: human 2.4 KB, zombies 1.1 KB per zombie (22 KB at 20).
+- Status codes: unknown match `NOT_FOUND`; side not remote or already joined `ALREADY_EXISTS`; wrong action length or out-of-range value `INVALID_ARGUMENT` (the match fails); missing or wrong token `UNAUTHENTICATED`; remote match cap reached `RESOURCE_EXHAUSTED`.
+
+#### 4.9.3 Server: remote sides in the match loop
+
+- **Stack:** `tonic` 0.14 + `prost` 0.14 + `tonic-prost`; `build.rs` in `zai-server` with `tonic-prost-build` (server and client code, the client for `tests/grpc.rs`), `protoc` from the `protoc-bin-vendored` build dependency (amd64 and arm64; no system package in any image). `server.Dockerfile` copies `proto/`. New modules: `grpc.rs` (service, token interceptor), `remote.rs` (`RemoteSlot`: join state, `mpsc` channels in both directions).
+- **Listener:** a second listener on `ZAI_GRPC_ADDR` (default `0.0.0.0:50051`) in the same process and runtime, sharing `AppState` (matches, replay store, model store); `main.rs` serves axum and tonic with `tokio::try_join!` and one shutdown signal. `lib.rs` exposes `grpc_service(state)` so tests bind both on `127.0.0.1:0`.
+- **`Agent::Remote`** (JSON `"remote"`, also accepted by `POST /api/matches`), `MatchRequest.realtime`. `MatchStatus` gains `waiting` (until every remote side has joined); `MatchInfo` gains `remote: {human, zombies}` (`waiting | joined | left`, null for non-remote sides), `agent_names` and `late_actions`. `ReplayAgent::Remote` with the `agent_name` in `human_model` / `zombie_model`. Mirrored in `web/src/types.ts`.
+- **Two-phase drivers.** `HumanDriver` / `ZombieDriver` get `Remote(RemoteSlot)`; one decision becomes `request(&env)` (remote: send `Observation`; bot or ONNX: compute immediately) then `receive().await`, with both sides requested before either is awaited, so the two clients' latencies overlap. With `speed > 0` the throttle sleep runs concurrently with the wait (step at `max(throttle deadline, actions received)`), so client inference is hidden behind the throttle.
+- **Lockstep (default for remote sides):** the server waits for the `Actions` of `(episode, tick)`; timeout `ZAI_REMOTE_TIMEOUT_S` (default 30 s) fails the match. `speed = 0` is unthrottled evaluation, as for bot matches.
+- **Realtime (`realtime: true`, needs `speed > 0`):** deadline = `decision_dt / speed` after the observation is sent (500 ms at x1, 31 ms at x16), sent as `deadline_ms`. A side without an action by the deadline repeats its last applied movement with interact `NONE` (tick 0: `STAY` / `NONE`); late actions for an old tick are dropped and counted in `late_actions`. The replay logs the applied actions, so re-simulation stays exact.
+- **Joins and lifecycle:** remote sides must join within `ZAI_REMOTE_JOIN_TIMEOUT_S` (default 60 s), else the match fails with `"remote <side> did not join"`. With `auto_restart`, joined streams stay open across episodes (`EpisodeEnd`, then `EpisodeStart`). Viewer pause stops sending observations (lockstep waits); stop sends `MatchEnd{stopped}`. A disconnect fails the match (`MatchEnd{failed}` to the other side), the unfinished episode is discarded (no replay), and there is no reconnect in M7. At most `ZAI_MAX_REMOTE_MATCHES` (default 8) concurrent matches with a remote side.
+- **Sampling is client-side.** The server only applies action indices (range-checked; masked human actions are no-ops in `Env::step`, as in training). This keeps each client's semantics (`deterministic`, v1 adapter, scripted Python bots) and puts the RNG where the policy lives.
+
+#### 4.9.4 Python client, showcase and containers
+
+- **`zai_agent`** (already listed in `pyproject.toml`): `zai_agent/proto/` holds the generated `agent_pb2.py`, `agent_pb2_grpc.py` and `.pyi` (grpcio-tools, protoc's `-I zai_agent/proto=proto/zai/v1` mapping so the stubs import package-relative), `client.py` (`Client(target, token=None, tls_root=None)`: `info()`, `create_match(...)`, `play(match_id, side, policy, name)` yielding episode results; `grpc.aio`, one task per side, so one process can drive both sides), `compat.py` (refuses unless server `obs_version` == local `zai_sim` `OBS_VERSION` and `obs_dim` matches `zai_env.layout`; checkpoints of another version play only through `zai_env.legacy` with `EpisodeStart.config_json`), `policies.py` (adapters with batch 1 around `RecurrentHumanPolicy` / `RecurrentZombiePolicy.from_checkpoint(..., config=...)`, the Python scripted and random bots of `zai_rl.bots`), `play.py` (CLI).
+- Dependencies: `grpcio` and `protobuf` in `pyproject.toml` (both have manylinux amd64 and aarch64 wheels); `grpcio-tools` pinned in the dev image only, to the same protobuf major as the runtime pin (generated code checks the runtime version). `make proto` regenerates the stubs in the dev container; `make lint` fails if regenerating changes them.
+- **CLI:** `python -m zai_agent.play --server server:50051 --human <ckpt.pt|scripted|random> --zombies <...> [--match ID] [--config configs/env/s0.yaml] [--speed 4] [--realtime] [--episodes N] [--deterministic]`. Without `--match` it creates the match with both given sides remote; with `--match` it joins one side of an existing match.
+- **Showcase:** `python -m arena.showcase --run-id <league>` follows `pool.json`, keeps one `auto_restart` remote match of the latest human vs the latest zombie snapshot on the current stage's env config at x1-x4, and recreates it when a newer snapshot appears. This is the live "what the league plays now" view, without exporting pool snapshots to ONNX.
+- **Containers:** new compose service `arena` (profile `arena`), image `zai-trainer` (whichever build exists; on the GPU server the cu126 image runs CPU-only), no GPU reservation, `CUDA_VISIBLE_DEVICES=""`, `cpus: 2` so it cannot starve the league, `ZAI_GRPC_TARGET=server:50051`, `checkpoints` mounted read-only. Make targets: `proto`, `play ARGS=...`, `showcase ARGS=...` (and `-gpu` variants reusing the cu126 image, as `export-replays-gpu`).
+- **Throughput (estimates, measured in M7.2).** One lockstep match with CPU PyTorch clients: ~1-2 ms per decision (two ~0.4 ms forward passes, protobuf, localhost RTT) -> ~500-1000 decisions/s, a 20 min S2 episode (2400 decisions) in 3-5 s; realtime needs only 2-32 decisions/s. Elo cross-play over gRPC: one matchup (384 episodes of up to 600 decisions on S0) takes ~1-4 min with 8 concurrent matches (GIL-bound client), so the ~26 matchups per snapshot pair take 30-90 min instead of 2-4 min in-process. Hence decision E11.
+
+#### 4.9.5 Observation parity test
+
+The row-9 criterion "obs parity with training verified by a hash test", made concrete:
+1. **Rust (`crates/zai-server/tests/grpc.rs`, tonic client):** human and zombies remote on S0, `s0_small` and the defaults, random actions from a seeded `ChaCha8Rng`; at every tick the received `obs` bytes equal `write_human_obs` / `write_zombie_obs` of an `Env` stepped locally with the same seed and actions, and `state_hash` matches. Catches server-side bugs without Python.
+2. **Python (`python/tests/test_grpc_parity.py`, against a real server):** both sides driven by `zai_agent` with randomly initialized actors (`torch.manual_seed(0)`, dims from `zai_env.layout`, so no fixture to regenerate when M6 changes a layout), one sampled and one deterministic episode per config. Per tick the client records `blake2b-64` of the obs and mask bytes, `reward`, `state_hash` and the actions it sent. Then `zai_sim.Env(start.config_json, start.seed)` replays the actions; per tick the hashes of `human_obs().tobytes()`, `zombie_obs().tobytes()`, `human_mask()` and `state_hash()` must match exactly, rewards bit-exactly, and the outcome at `EpisodeEnd`. In the deterministic episode, the in-process `Recurrent*Policy` fed the local observations must choose the same actions that went over the wire (training path == gRPC path end to end). Finally `GET /api/replays/{replay_id}` holds the same action log and its re-simulation reaches `EpisodeEnd.state_hash`.
+3. **Version guard:** a `Join` with `obs_version - 1` or a wrong `obs_dim` gets `FAILED_PRECONDITION` and no observation.
+
+Byte equality across two builds (server binary, `zai_sim` wheel) holds because both come from the same crate, rustc 1.88 and target arch, with no fast-math, and both runtime images are bookworm (same glibc `sin` / `cos` / `atan2`). The test is what guards this assumption (risk below). The pytest fixture starts `$CARGO_TARGET_DIR/debug/zai-server` (built by the `cargo test` step of `make test`) as a subprocess on free ports with a temporary `ZAI_DATA_DIR`, so `make test` needs no compose-in-compose; a `make grpc-smoke` target runs the same test from the `arena` container against the `server` container.
+
+#### 4.9.6 First-person view
+
+- **Camera modes.** `Scene3D` gets `orbit | follow | first` (the Follow button becomes a 3-way control, persisted as `zai.camera`). First person: camera at the interpolated human position, eye height 1.6 m, yaw from the snapshot heading with shortest-arc interpolation over the decision interval (a reversal turns over 0.5 s of sim time instead of snapping), small walking bob. Characters at true scale (`bodyScale = 1`) with zombies drawn 1.75 m tall in this mode (visual only; the collision radius stays 0.3 m). The human's own body is hidden. Caught: the camera drops to 0.4 m and pitches over `FALL_MS` with a red tint; starved: fade to grey; truncated: "survived".
+- **Field of view and range.** Horizontal FOV 120 degrees, the vision cone (three.js `fov` is vertical: `2 atan(tan(60 deg) / aspect)`, 88 degrees at 16:9, capped at 100 degrees on narrow windows). Range: `THREE.Fog` from 70 to 100 m and `camera.far = 105`, with radial fog distance (`fog_vertex` patched to `length(mvPosition.xyz)`): three's default fog uses view depth, which at the edges of a 120 degree view would show objects up to 200 m away. Walls are 2.4 m and the eye is at 1.6 m, so depth occlusion behind walls and closed doors matches the 2D line of sight; open doors are already rendered as floor strips.
+- **Only what the human sees.** Snapshots gain `seen_zombies` and `seen_food`: indices into the frame's `zombies` and `food` arrays, from `Env::visible_zombies()` / `visible_food()`, the exact rule that fills the human observation (radius, FOV, line of sight to the center). In first person, entities not listed are hidden. Depth occlusion alone would leak bodies peeking around corners whose center is out of sight, and food behind the line of sight. An "x-ray" toggle (off by default) shows hidden zombies translucent, to understand catches. The top-down view outlines seen zombies (cheap and useful). Noise rings are not drawn in the world in first person (all noise events are the human's own; 100-200 m rings sweeping past the camera are clutter); the HUD flashes the event type and radius instead.
+- **HUD.** The existing HUD (time, hunger bar, carried, outcome) plus, in first person: speed factor `max(0, 1 - 0.2 * carried)` as a percentage, seen zombie count, compass heading, own-noise flash. Inside a house the HUD shows which door is which (front/back) when visible.
+- **Replays.** Frames are identical for live matches and replays, and replays re-simulate through `frames::snapshot`, so first person works on every replay (including training replays and replays recorded before M7, which gain `seen_*` on re-simulation), with seek snapping the camera (discontinuous tick, as today).
+- **Size and speed.** `seen_*` adds ~10-40 bytes per snapshot. Target >= 50 fps at 1080p on the pilot MacBook (Chrome) at 20 zombies / 120 food on the 500 m map; `?fps=1` shows a frame-time overlay for the check.
+
+#### 4.9.7 Sub-milestones
+
+| Step | Content | Tests / runnable result | Effort |
+|---|---|---|---|
+| **M7.0** Protocol and codegen | `proto/zai/v1/agent.proto` (4.9.2), `build.rs` with `tonic-prost-build` + `protoc-bin-vendored`, `ZAI_GRPC_ADDR` listener, `GetInfo` from `OBS_VERSION` and the layout tables; Python deps, `make proto`, checked-in stubs and drift check; `server.Dockerfile` copies `proto/`; compose publishes `127.0.0.1:50051:50051` | `tests/grpc.rs`: `GetInfo` dims and blocks equal `HUMAN_LAYOUT` / `ZOMBIE_LAYOUT`; pytest `GetInfo` against the subprocess server; `make lint` drift check | ~1 day |
+| **M7.1** Remote sides, lockstep | `Agent::Remote`, `CreateMatch`, `Play`, `RemoteSlot`, two-phase drivers, `waiting` status, version check, action validation, join / action timeouts, disconnect handling, remote match cap, `ReplayAgent::Remote`, `MatchInfo` fields, `types.ts` | `tests/grpc.rs`: remote human vs scripted zombies to the end, both remote, obs bytes vs local `Env` (4.9.5 step 1), mismatch refused, join timeout and disconnect -> `failed`, the viewer WebSocket still receives frames, replay re-simulates to its hash; existing `e2e.rs` unchanged | ~2.5 days |
+| **M7.2** Python client and parity | `zai_agent` (`client`, `compat`, `policies`, `play`), `make play`; v1 checkpoints through the adapter; throughput measurement | `test_grpc_parity.py` (4.9.5 step 2-3); `make play` with two checkpoints on the pilot; throughput in `docs/reports/grpc_throughput.md` | ~2 days |
+| **M7.3** Realtime, exposure, arena container | Realtime deadlines, repeat-last-movement, `late_actions`; `ZAI_AGENT_TOKEN` interceptor; `compose.tls.yaml` gRPC site (`reverse_proxy h2c://server:50051`, `tls internal`), client `--tls-root`; `arena` compose service; `arena.showcase`; `make showcase`, `make grpc-smoke`; `docs/GPU_SERVER.md` tunnel `-L 50051:localhost:50051` | `tests/grpc.rs`: a client that skips every 10th tick at x16 gets repeated movement, `late_actions` counted, replay exact; token required when set; pytest through Caddy with the local root certificate (compose smoke only) | ~1.5 days |
+| **M7.4** First-person view | `seen_zombies` / `seen_food` in `frames.rs` and `types.ts`; `Scene3D` camera modes, radial fog, FOV, visibility filter, x-ray toggle, HUD additions, death effects; seen outline in `topdown.ts` | Rust: `seen_*` equal `visible_*` on arranged states, and their count equals the valid rows of the human obs zombie block when <= 32; `npm run typecheck`; vitest for the pure helpers (horizontal-to-vertical FOV, shortest-arc yaw, visibility filter); manual checklist on live, replay, seek, death, inside a house | ~2.5 days |
+| **M7.5** Acceptance and docs | Run 4.9.8 on the pilot and on the GPU server's CPU next to a league; `CLAUDE.md` commands; section 9 row | Checklist of 4.9.8 | ~0.5 day |
+
+Total ~10 days of development, no GPU time.
+
+#### 4.9.8 Acceptance criteria for M7
+
+1. `make test` and `make lint` pass, including `tests/grpc.rs`, the Python gRPC tests, the stub drift check and the web type check and helper tests; M6 tests are unchanged.
+2. With `make up` and `make play ARGS="--human /checkpoints/human/<run>/latest.pt --zombies /checkpoints/zombie/<run>/latest.pt --speed 4"` the `arena` container (CPU) creates a live match with both sides remote; it is visible in the viewer, runs to the end, and its replay names both agents and re-simulates to its final hash. The same works in realtime mode at x16.
+3. Parity (4.9.5) passes on `s0_small`, S0 and the defaults: per-tick obs, mask and state hashes and rewards bit-equal to `zai_sim.Env` on the same seed and actions; deterministic actions equal to the in-process policy's; version and dimension mismatches refused before the first observation.
+4. A v1 checkpoint (`human-s0-gpu1`) plays a live match over gRPC through the adapter (the server refuses it as ONNX).
+5. `arena.showcase` follows a running league's pool and switches to new snapshots without a restart of the server or the viewer.
+6. The 3D view's first-person mode renders from the human's position and heading, live and in replays (with seek), shows only `seen_*` entities (x-ray off), and reaches the frame-rate target of 4.9.6.
+7. Measured lockstep throughput is reported; the decision of E11 is confirmed or revisited with the number.
+
+#### 4.9.9 Risks
+
+- **Cross-build float determinism:** the server binary and the wheel are different builds. Same rustc, arch and glibc keep them bit-equal; a change of base image (for example musl/alpine for the server) or `target-cpu=native` on one side would break parity, and the parity test is the detector. Mitigation: keep both images on `rust:1.88-bookworm` / bookworm runtimes and never set target-cpu flags.
+- **M6 changes a layout mid-M7 (v3):** the protocol carries version and dims, the parity test uses randomly initialized actors built from the layout, so only the M6 ONNX fixtures need regeneration (an M6 task). Old checkpoints play over gRPC only through an adapter, if M6 writes one.
+- **Merge conflicts with M6:** the overlap is small (`Cargo.lock`, `pyproject.toml`, `compose.yaml`, `Makefile`, `web/src/types.ts`, `CLAUDE.md`); M7 does not touch `zai_rl/`, `obs.rs` or `arena/league.py`. Branch decision E13.
+- **Protobuf gencode/runtime skew** in Python: pin `grpcio-tools` and `protobuf` together; the drift check regenerates with the pinned tools.
+- **Wide FOV comfort:** 120 degrees on a flat screen distorts the edges; it is the honest view of what the policy sees. A 90 degree comfort toggle is a later cosmetic if needed.
+- **Exposure:** the HTTP API on 8080 is unauthenticated today; gRPC is stricter by default (localhost binding plus an optional token). A shared token for both is a later decision.
+- **Browsers cannot speak raw gRPC:** a browser-based player would need `tonic-web` or a WebSocket bridge; not planned in M7.
+
+#### 4.9.10 Decisions
+
+| # | Decision | Options | Recommendation |
+|---|---|---|---|
+| E1 | Role of gRPC | (a) a `remote` side type for external processes (PyTorch checkpoints incl. pool snapshots and v1 via adapter, other languages); in-process ONNX stays the default for viewer matches and the New match form; (b) replace in-process ONNX with gRPC agents (viewer matches then need an agent container); (c) also use gRPC for training or evaluation throughput | (a) |
+| E2 | Rust gRPC stack and codegen | (a) `tonic` 0.14 + `prost`, `build.rs` with `tonic-prost-build`, `protoc` from `protoc-bin-vendored`; (b) same with checked-in generated Rust (no build-time protoc, drift risk); (c) system `protoc` from apt in the dev and server images | (a) |
+| E3 | gRPC port | (a) separate listener `ZAI_GRPC_ADDR` (50051) in the same process, as planned in section 6; (b) multiplex on 8080 by content type | (a) |
+| E4 | Python client and stubs | (a) `grpcio` + `protobuf`, stubs generated by `grpcio-tools` in the dev container (`make proto`), checked in under `zai_agent/proto/`, drift check in `make lint`; (b) generated during image builds and `ci-py-develop` (not checked in); (c) `betterproto` / `grpclib` | (a) |
+| E5 | Stream granularity | (a) one bidi `Play` stream per (match, side), one process may hold both; (b) one stream per match driving both sides; (c) one stream multiplexing many matches (batched remote evaluation) | (a); (c) only if a remote batched evaluator is ever needed |
+| E6 | Match modes and timeouts | (a) lockstep by default for remote sides (`speed` caps the rate, 0 = unthrottled), opt-in realtime with deadline `decision_dt / speed` and repeat-last-movement on a miss; join timeout 60 s, lockstep action timeout 30 s; (b) realtime only; (c) lockstep only | (a) |
+| E7 | Remote disconnect | (a) match `failed`, unfinished episode discarded, other side gets `MatchEnd`; (b) the scripted bot takes over the side; (c) reconnect with a resume token | (a) |
+| E8 | Where actions are sampled | (a) client-side, the server applies range-checked indices; (b) client sends logits, the server masks and samples as in `policy.rs` | (a) |
+| E9 | Parity test design | (a) Rust tonic test vs local `Env` plus the Python end-to-end test of 4.9.5 (per-tick obs/mask/state hashes, rewards, deterministic actions vs the in-process policy, replay re-simulation); (b) server-computed obs hashes compared with in-process hashes only; (c) outcome statistics only | (a) |
+| E10 | Exposure and auth of 50051 | (a) published on `127.0.0.1` only (SSH tunnel), plaintext inside the compose network, optional bearer token `ZAI_AGENT_TOKEN` (required when set), TLS only through a Caddy site in `compose.tls.yaml` (`h2c` upstream), remote match cap 8; (b) published on all interfaces in plaintext like 8080; (c) mutual TLS | (a) |
+| E11 | Elo cross-play placement (revisits D7) | (a) Elo cross-play stays in-process in the trainer container (D7 a unchanged); the new CPU `arena` container only runs gRPC play and showcase matches; (b) move the in-process Elo arena into the CPU container (competes with the league's 17 simulation threads); (c) Elo over gRPC (30-90 min per snapshot pair instead of 2-4 min) | (a) |
+| E12 | First-person view | (a) mode of the existing `Scene3D`: horizontal FOV 120 degrees, radial fog 70-100 m, only `seen_*` entities (new per-snapshot indices from `visible_zombies` / `visible_food`), x-ray toggle off by default, own noise in the HUD; (b) same camera, all entities rendered, relying on depth occlusion, fog and frustum (approximate, leaks around corners); (c) 90 degree FOV for comfort | (a) |
+| E13 | Branch | (a) `m7` from the current `m6` (needs layout v2 and the stats), merging `m6` into `m7` as M6 progresses; M7 merges to `main` with or after M6; (b) `m7` from `main` | (a) |
+
 ---
 
 ## 5. Communication protocols and data flow
@@ -722,7 +904,7 @@ sequenceDiagram
   S-->>Z: EpisodeEnd{outcome}
 ```
 
-**gRPC agent API** (`proto/zai/v1/agent.proto`, sketch):
+**gRPC agent API** (`proto/zai/v1/agent.proto`, sketch; superseded by the M7 plan, sections 4.9.2-4.9.3):
 
 ```proto
 service AgentService {
@@ -848,5 +1030,5 @@ Each milestone ends with something runnable through `docker compose` / `make` an
 | **M4 Human training** | `zai_rl` recurrent PPO for the human vs scripted zombies (S0), trainer image with GPU override, TensorBoard + metrics push | Human survival beats the scripted human baseline on S0; curves visible in the viewer. |
 | **M5 Zombie training** | MAPPO with shared params and centralized critic vs scripted human (S0) | Zombie catch rate beats the scripted zombie baseline on S0. |
 | **M6 Co-training + arena** (plan in section 4.8) | M6.0 throughput profiling; M6.1 observation layout v2 (constant normalization) with distilled starting checkpoints; M6.2 Rust episode tactic counters; M6.3 `MatchTrainingEnv` with env groups A/B/C in one league trainer, snapshot pool with PFSP and imbalance guard; M6.4 arena with cross-play Elo, anchors, exploitability probe and the viewer league panel; M6.5 curriculum gates `s0_small` -> S0 -> S1 | League passes the `s0_small` and S0 gates and advances automatically; on S1 both sides gain >= +100 Elo over their S1 starters against fixed anchors, without cycling (section 4.8.8); Elo, cross-play, gate and tactic metric panels in the viewer. |
-| **M7 gRPC agents + 3D view** | `agent.proto`, `zai_agent` client, server agent API, Three.js first-person view | Arena drives a live server match with two checkpoints over gRPC; obs parity with training verified by a hash test; 3D view follows the human. |
+| **M7 gRPC agents + 3D view** (plan in section 4.9, CPU-only, in parallel with M6) | M7.0 `agent.proto`, tonic listener on 50051, `GetInfo`, Python stubs; M7.1 remote sides in the match loop (lockstep), `CreateMatch` / `Play`; M7.2 `zai_agent` client, `make play`, obs parity test; M7.3 realtime mode, token/TLS exposure, CPU `arena` container and league showcase; M7.4 first-person mode of the 3D view with per-snapshot visibility; M7.5 acceptance | Arena drives a live server match with two checkpoints over gRPC; obs parity with training verified by a hash test; 3D view follows the human. Made concrete in section 4.9.8: per-tick obs/state hashes bit-equal to `zai_sim.Env` on the same seed and actions, version mismatches refused, lockstep and realtime modes, first-person view from the human's position and heading showing only what the human sees, live and in replays. |
 | **M8 Full spec runs** | S2 training at PRD values, long runs, ablations (zombie communication, noise sigma, respawn) | Report on emergent tactics using section 4.5 metrics vs baselines. |
