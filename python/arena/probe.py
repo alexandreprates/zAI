@@ -117,6 +117,11 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=10_000_000)
     parser.add_argument("--episodes", type=int, default=128)
     parser.add_argument("--num-threads", type=int, default=10)
+    # Diagnostics (docs/ARCHITECTURE.md 4.8.9, D3): fine-tune with another env config (e.g.
+    # without the zombie shaping) or from another checkpoint than the learner's latest.pt.
+    parser.add_argument("--env-config", help="training env config instead of the league's")
+    parser.add_argument("--init", type=Path, help="checkpoint the probe starts from")
+    parser.add_argument("--tag", default="", help="suffix of the probe id")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     root = Path(os.environ.get("ZAI_CHECKPOINT_DIR", "checkpoints"))
@@ -135,14 +140,17 @@ def main() -> None:
     for side in sides:
         mine = root / side / args.run_id / "latest.pt"
         opponent = root / ("zombie" if side == "human" else "human") / args.run_id / "latest.pt"
-        probe_id = f"{args.run_id}-probe-{side}-{state['steps'] // 1_000_000}m"
-        cfg = probe_config(league, side, opponent, mine, args.steps, args.num_threads)
+        probe_id = f"{args.run_id}-probe-{side}-{state['steps'] // 1_000_000}m{args.tag}"
+        init = args.init or mine
+        cfg = probe_config(league, side, opponent, init, args.steps, args.num_threads)
+        if args.env_config:
+            cfg["env_config"] = args.env_config
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             yaml.safe_dump(cfg, f)
         module = "zai_rl.train" if side == "human" else "zai_rl.train_zombie"
         t0 = time.time()
         log.info(
-            "probe %s: fine-tuning %s against %s for %d steps", probe_id, mine, opponent, args.steps
+            "probe %s: fine-tuning %s against %s for %d steps", probe_id, init, opponent, args.steps
         )
         subprocess.run(
             [sys.executable, "-m", module, "--config", f.name, "--run-id", probe_id],
@@ -156,6 +164,8 @@ def main() -> None:
         row = {
             "side": side,
             "probe": probe_id,
+            "init": str(init),
+            "env_config": cfg["env_config"],
             "path": str(probe),
             "league_steps": state["steps"],
             "learner_score": learner_score,

@@ -113,6 +113,12 @@ def test_freeze_guard_skips_the_winning_side_only_while_engaged():
     assert g.state == 0 and not g.overrides("human", 4)[2]
 
 
+def test_scripted_share_per_learner_side():
+    p = LeagueParams(scripted_share={"human": 0.2, "zombie": 0.0})
+    assert p.scripted_for("human") == 0.2 and p.scripted_for("zombie") == 0.0
+    assert LeagueParams(scripted_share=0.3).scripted_for("zombie") == 0.3
+
+
 def test_lr_floor_stops_the_linear_decay():
     from zai_rl.algos.common import scheduled_lr
 
