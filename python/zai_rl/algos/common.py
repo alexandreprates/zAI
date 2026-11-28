@@ -100,3 +100,8 @@ def save_checkpoint(path: Path, algo: Checkpointable, extra: dict[str, Any]) -> 
     tmp = path.with_suffix(".tmp")
     torch.save({**algo.state_dict(), **extra}, tmp)
     tmp.replace(path)
+
+
+def scheduled_lr(lr: float, progress: float, lr_floor: float = 0.0, lr_scale: float = 1.0) -> float:
+    """Linear decay of `lr` over `progress` in [0, 1], stopping at `lr_floor * lr`."""
+    return lr * lr_scale * max(lr_floor, 1.0 - progress)

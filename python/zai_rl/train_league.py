@@ -74,6 +74,9 @@ class LeagueParams:
     guard_low: float = 0.15
     guard_windows: int = 3  # consecutive windows before the guard engages
     guard_release: tuple[float, float] = (0.3, 0.7)
+    # scale: the winning side updates at half the lr; freeze: it skips its updates while the
+    # guard is engaged (docs/ARCHITECTURE.md section 4.8.9). The losing side gets +1 epoch.
+    guard_mode: str = "scale"
     starvation_alarm: float = 0.5
 
 
@@ -152,6 +155,8 @@ class LeagueConfig:
         bad = set(lg) - {f.name for f in fields(LeagueParams)}
         if bad:
             raise ValueError(f"unknown league.* keys: {sorted(bad)}")
+        if lg.get("guard_mode", "scale") not in ("scale", "freeze"):
+            raise ValueError("league.guard_mode must be 'scale' or 'freeze'")
         groups = league_groups(
             raw.get("num_envs", 1024),
             raw.get("zombie_counts", [3, 6, 9]),
@@ -221,6 +226,7 @@ class Guard:
         self.state = 0  # +1: zombies dominate, -1: the human dominates
         self.high = self.low = self.starving = 0
         self.alarm = False
+        self.frozen = {"human": 0, "zombie": 0}  # iterations each side skipped its update
 
     def update(self, outcomes: np.ndarray) -> float:
         """Folds in one window of group A outcomes; returns the window's zombie score."""
@@ -241,11 +247,13 @@ class Guard:
         self.alarm = self.starving >= self.p.guard_windows
         return s_z
 
-    def overrides(self, side: str, epochs: int) -> tuple[int, float]:
-        """`(epochs, lr_scale)` of `side`'s next update."""
+    def overrides(self, side: str, epochs: int) -> tuple[int, float, bool]:
+        """`(epochs, lr_scale, frozen)` of `side`'s next update; a frozen side skips it."""
         losing = (self.state == 1 and side == "human") or (self.state == -1 and side == "zombie")
         winning = (self.state == 1 and side == "zombie") or (self.state == -1 and side == "human")
-        return epochs + int(losing), 0.5 if winning else 1.0
+        if self.p.guard_mode == "freeze":
+            return epochs + int(losing), 1.0, winning
+        return epochs + int(losing), 0.5 if winning else 1.0, False
 
 
 class League:
@@ -262,6 +270,7 @@ class League:
         self.guard = Guard(p)
         self.steps = self.iteration = 0
         self.last_snapshot = 0
+        self.updated_since_snapshot = {"human": True, "zombie": True}
         self.last_probe = 0
         self.stage_index = 0
         self.stage_start = 0
@@ -332,7 +341,9 @@ class League:
         for e in finals.values():
             self.pool.add(e)
         self.starters = {side: e.id for side, e in finals.items()}
+        frozen = self.guard.frozen
         self.guard = Guard(p)
+        self.guard.frozen = frozen  # frozen_frac_* covers the whole run
         self.human.optimizer = torch.optim.Adam(
             list(self.human.actor.parameters()) + list(self.human.critic.parameters()),
             lr=self.cfg.human.lr,
@@ -397,7 +408,12 @@ class League:
         self.measure_baselines()
 
     def snapshot(self) -> None:
+        """Adds both learners to the pool, except a side that has not updated since its last
+        snapshot (frozen by the guard), which would only duplicate it."""
         for side, algo in (("human", self.human), ("zombie", self.zombie)):
+            if not self.updated_since_snapshot[side]:
+                continue
+            self.updated_since_snapshot[side] = False
             entry_id = self.pool.next_id(side)
             path = self.dir / "pool" / side / f"{entry_id}.pt"
             save_snapshot(path, algo.actor, side, self.steps, self.stage.name)
@@ -430,6 +446,7 @@ class League:
             "iteration": self.iteration,
             "steps": self.steps,
             "last_snapshot": self.last_snapshot,
+            "updated_since_snapshot": self.updated_since_snapshot,
             "last_probe": self.last_probe,
             "stage_index": self.stage_index,
             "stage_start": self.stage_start,
@@ -461,6 +478,9 @@ class League:
             algo.load_state_dict(sd)
         self.iteration, self.steps = state["iteration"], state["steps"]
         self.last_snapshot = state["last_snapshot"]
+        self.updated_since_snapshot = state.get(
+            "updated_since_snapshot", {"human": True, "zombie": True}
+        )
         self.last_probe = state.get("last_probe", self.steps)
         if state.get("stage_index", 0) != self.stage_index:
             self.stage_index = state["stage_index"]
@@ -474,6 +494,7 @@ class League:
         self.pool = Pool.from_state_dict(state["pool"])
         for k, v in state["guard"].items():
             setattr(self.guard, k, v)
+        self.guard.frozen = dict(state["guard"].get("frozen", {"human": 0, "zombie": 0}))
         self.rng.bit_generator.state = state["rng"]
         if not self.baseline:
             self.measure_baselines()
@@ -783,10 +804,20 @@ class League:
             zr = zro.finish(obs.zombie_obs[env.zombie_agent_sel], obs.state[env.zombie_env_sel])
             # Learning-rate schedules run over each stage's maximum budget.
             progress = min(1.0, in_stage / st.max_steps)
-            he, hs = self.guard.overrides("human", cfg.human.epochs)
-            ze, zs = self.guard.overrides("zombie", cfg.zombie.epochs)
-            hstat = self.human.update(hr, progress, he, hs)
-            zstat = self.zombie.update(zr, progress, ze, zs)
+            stats_ = {}
+            for side, algo, ro, epochs in (
+                ("human", self.human, hr, cfg.human.epochs),
+                ("zombie", self.zombie, zr, cfg.zombie.epochs),
+            ):
+                ep, scale, frozen = self.guard.overrides(side, epochs)
+                if frozen:
+                    self.guard.frozen[side] += 1
+                    stats_[side] = {"train/updated": 0.0}
+                else:
+                    self.updated_since_snapshot[side] = True
+                    stats_[side] = {**algo.update(ro, progress, ep, scale), "train/updated": 1.0}
+                stats_[side][f"league/frozen_{side}"] = float(frozen)
+            hstat, zstat = stats_["human"], stats_["zombie"]
             t2 = time.time()
             self.iteration += 1
             self.steps += per_iter
@@ -796,6 +827,8 @@ class League:
 
             hs_ = dict(hstat)
             zs_ = dict(zstat)
+            for side, out in (("human", hs_), ("zombie", zs_)):
+                out[f"league/frozen_frac_{side}"] = self.guard.frozen[side] / self.iteration
             perf = {
                 "perf/steps_per_s": per_iter / (t2 - t0),
                 "perf/rollout_s": t1 - t0,
@@ -825,7 +858,12 @@ class League:
                     ps = [self.pool.p(side, e) for e in w]
                     if ps:
                         out["pool/score_min"], out["pool/score_mean"] = min(ps), float(np.mean(ps))
-            if self.steps - self.last_snapshot >= p.snapshot_every_steps:
+            budget_end = (
+                self.steps >= cfg.total_steps or self.steps - self.stage_start >= st.max_steps
+            )
+            if self.steps - self.last_snapshot >= p.snapshot_every_steps or (
+                budget_end and self.steps > self.last_snapshot
+            ):
                 self.snapshot()
             passed = False
             gate_due = (

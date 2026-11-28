@@ -546,6 +546,115 @@ fn a_catch_pays_the_catch_reward_plus_the_maximum_potential() {
     );
 }
 
+fn surround(zombies: usize) -> Env {
+    let mut cfg = open_field(zombies);
+    cfg.reward.zombie_surround_shaping = 0.25;
+    cfg.reward.zombie_surround_range_m = 30.0;
+    let mut env = make_env(cfg);
+    env.human.pos = Vec2::new(200.0, 200.0);
+    env
+}
+
+/// Places zombie `i` at `d` m from the human on bearing `deg`.
+fn at_bearing(env: &mut Env, i: usize, d: f32, deg: f32) {
+    let a = deg.to_radians();
+    env.zombies[i].pos = env.human.pos + d * Vec2::new(a.cos(), a.sin());
+}
+
+#[test]
+fn surround_potential_is_zero_when_disabled_or_with_one_zombie() {
+    let mut env = make_env(open_field(2));
+    env.human.pos = Vec2::new(200.0, 200.0);
+    at_bearing(&mut env, 0, 10.0, 0.0);
+    at_bearing(&mut env, 1, 10.0, 180.0);
+    assert_eq!(env.surround_potential(), 0.0);
+    let mut env = surround(1);
+    at_bearing(&mut env, 0, 10.0, 0.0);
+    assert!(close(env.surround_potential(), 0.0));
+}
+
+#[test]
+fn surround_potential_rewards_spread_and_not_bunching() {
+    let k = 0.25;
+    let mut env = surround(2);
+    at_bearing(&mut env, 0, 10.0, 0.0);
+    at_bearing(&mut env, 1, 10.0, 180.0);
+    assert!(
+        close(env.surround_potential(), 2.0 * k / 3.0),
+        "{}",
+        env.surround_potential()
+    );
+
+    let mut env = surround(3);
+    for i in 0..3 {
+        at_bearing(&mut env, i, 10.0, 120.0 * i as f32);
+    }
+    assert!(
+        close(env.surround_potential(), k),
+        "{}",
+        env.surround_potential()
+    );
+
+    for i in 0..3 {
+        at_bearing(&mut env, i, 5.0 + 5.0 * i as f32, 40.0);
+    }
+    assert!(
+        close(env.surround_potential(), 0.0),
+        "{}",
+        env.surround_potential()
+    );
+}
+
+#[test]
+fn surround_potential_is_continuous_at_the_range() {
+    let mut env = surround(3);
+    at_bearing(&mut env, 0, 10.0, 0.0);
+    at_bearing(&mut env, 1, 10.0, 120.0);
+    at_bearing(&mut env, 2, 29.995, 240.0);
+    let inside = env.surround_potential();
+    at_bearing(&mut env, 2, 30.005, 240.0);
+    let outside = env.surround_potential();
+    assert!((inside - outside).abs() < 1e-3, "{inside} vs {outside}");
+}
+
+#[test]
+fn surround_potential_is_k_on_a_catch_and_zero_on_starvation() {
+    let mut env = surround(1);
+    env.zombies[0].pos = Vec2::new(200.8, 200.0);
+    let r = env.step(human(EAST, INTERACT_NONE), &stay(&env));
+    assert_eq!(r.outcome, Outcome::Caught);
+    let mut phi = Vec::new();
+    env.zombie_potentials(&mut phi);
+    assert_eq!(phi, vec![0.25]);
+
+    let mut env = surround(2);
+    at_bearing(&mut env, 0, 10.0, 0.0);
+    at_bearing(&mut env, 1, 10.0, 180.0);
+    env.human.hunger_s = 0.25;
+    let r = env.step(IDLE, &stay(&env));
+    assert_eq!(r.outcome, Outcome::Starved);
+    env.zombie_potentials(&mut phi);
+    assert_eq!(phi, vec![0.0; 2]);
+    let lost = 2.0 * 0.25 / 3.0;
+    for &r in env.zombie_rewards() {
+        assert!(close(r, -0.002 - lost), "{r}");
+    }
+}
+
+#[test]
+fn holding_a_ring_pays_the_distance_reward_plus_the_discounted_surround() {
+    let mut env = surround(2);
+    env.cfg.reward.zombie_distance_shaping = 0.5;
+    at_bearing(&mut env, 0, 20.0, 0.0); // Phi = 0.4
+    at_bearing(&mut env, 1, 20.0, 180.0);
+    let psi = env.surround_potential();
+    env.step(IDLE, &stay(&env));
+    let g = env.cfg.reward.gamma;
+    for &r in env.zombie_rewards() {
+        assert!(close(r, -0.002 + (g - 1.0) * (0.4 + psi)), "{r}");
+    }
+}
+
 #[test]
 fn zombie_rewards_equal_the_team_reward_without_shaping() {
     let mut env = make_env(open_field(3));

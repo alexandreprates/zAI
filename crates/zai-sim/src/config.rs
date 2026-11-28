@@ -100,6 +100,13 @@ pub struct RewardConfig {
     pub zombie_distance_shaping_range_m: f32,
     /// Which distance drives each zombie's potential.
     pub zombie_distance_shaping_mode: ZombieShapingMode,
+    /// Scale `k` of the team surround potential added to every zombie's potential (0 disables
+    /// it): `Psi = k * (W - |sum w_i u_i|) / max(W, 2)` with `w_i = 1 - min(d_i, R) / R` and `u_i`
+    /// the unit vector from the human to zombie `i`; `k` when the human is caught, 0 when it
+    /// starves (docs/ARCHITECTURE.md section 4.8.9).
+    pub zombie_surround_shaping: f32,
+    /// Distance `R` at which a zombie stops counting for the surround potential.
+    pub zombie_surround_range_m: f32,
 }
 
 /// Credit assignment of the zombie distance shaping.
@@ -197,6 +204,8 @@ impl Default for RewardConfig {
             zombie_distance_shaping: 0.0,
             zombie_distance_shaping_range_m: 100.0,
             zombie_distance_shaping_mode: ZombieShapingMode::PerAgent,
+            zombie_surround_shaping: 0.0,
+            zombie_surround_range_m: 30.0,
         }
     }
 }
@@ -262,6 +271,9 @@ impl Config {
         }
         if self.reward.zombie_distance_shaping_range_m <= 0.0 {
             return err("reward.zombie_distance_shaping_range_m must be positive".into());
+        }
+        if self.reward.zombie_surround_range_m <= 0.0 {
+            return err("reward.zombie_surround_range_m must be positive".into());
         }
         if let Some(i) = self.food_respawn_interval_s {
             if i < 0.0 {

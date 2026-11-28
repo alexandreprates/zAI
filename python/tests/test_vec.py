@@ -33,8 +33,19 @@ def test_shapes_and_dtypes(small_config):
     assert step.outcome.dtype == np.uint8
 
 
-def test_vec_env_matches_single_envs_including_auto_reset(small_config):
-    """Rust-vs-Python parity: the batched env equals independent single envs."""
+@pytest.mark.parametrize("surround", [False, True])
+def test_vec_env_matches_single_envs_including_auto_reset(small_config, surround):
+    """Rust-vs-Python parity: the batched env equals independent single envs (also with the
+    distance and surround shaping of the zombies on)."""
+    if surround:
+        small_config = {
+            **small_config,
+            "reward": {
+                **small_config.get("reward", {}),
+                "zombie_distance_shaping": 0.5,
+                "zombie_surround_shaping": 0.25,
+            },
+        }
     num_envs, base_seed = 6, 42
     venv = ZaiVecEnv(small_config, num_envs=num_envs, seed=base_seed, num_threads=3)
     venv.reset()

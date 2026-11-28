@@ -391,10 +391,11 @@ impl Env {
     pub(crate) fn zombie_potentials(&self, out: &mut Vec<f32>) {
         let rc = &self.cfg.reward;
         let c = rc.zombie_distance_shaping;
+        let k = rc.zombie_surround_shaping;
         out.clear();
         let value = match self.outcome {
-            _ if c == 0.0 => Some(0.0),
-            Outcome::Caught => Some(c),
+            _ if c == 0.0 && k == 0.0 => Some(0.0),
+            Outcome::Caught => Some(c + k),
             Outcome::Starved => Some(0.0),
             Outcome::Running | Outcome::Truncated => None,
         };
@@ -412,6 +413,31 @@ impl Env {
                 out.resize(self.zombies.len(), v);
             }
         }
+        if k != 0.0 {
+            let psi = self.surround_potential();
+            for p in out.iter_mut() {
+                *p += psi;
+            }
+        }
+    }
+
+    /// Team surround potential `Psi` of `RewardConfig::zombie_surround_shaping` while the
+    /// episode runs: in `[0, k]`, `k` for zombies evenly spread around the human, 0 for zombies
+    /// on one bearing or out of range. Continuous in all positions; summed in zombie order.
+    pub(crate) fn surround_potential(&self) -> f32 {
+        let rc = &self.cfg.reward;
+        let range = rc.zombie_surround_range_m;
+        let (mut w_sum, mut v) = (0.0f32, Vec2::ZERO);
+        for z in &self.zombies {
+            let delta = z.pos - self.human.pos;
+            let d = delta.length();
+            let w = 1.0 - d.min(range) / range;
+            if w > 0.0 && d > 0.0 {
+                w_sum += w;
+                v += delta * (w / d);
+            }
+        }
+        rc.zombie_surround_shaping * (w_sum - v.length()) / w_sum.max(2.0)
     }
 
     /// One physics tick. Returns the outcome if the episode ended.

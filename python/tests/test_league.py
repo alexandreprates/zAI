@@ -92,12 +92,34 @@ def test_guard_engages_after_consecutive_windows_and_releases():
     assert g.state == 0
     g.update(caught)
     assert g.state == 1
-    assert g.overrides("human", 4) == (5, 1.0) and g.overrides("zombie", 3) == (3, 0.5)
+    assert g.overrides("human", 4) == (5, 1.0, False)
+    assert g.overrides("zombie", 3) == (3, 0.5, False)
     g.update(np.array([OUTCOME_CAUGHT] * 5 + [OUTCOME_TRUNCATED] * 5))
     assert g.state == 0
     for _ in range(2):
         g.update(np.full(10, OUTCOME_STARVED))
     assert g.alarm
+
+
+def test_freeze_guard_skips_the_winning_side_only_while_engaged():
+    g = Guard(LeagueParams(guard_windows=2, guard_low=0.3, guard_mode="freeze"))
+    assert g.overrides("human", 4) == (4, 1.0, False)
+    for _ in range(2):
+        g.update(np.full(10, OUTCOME_TRUNCATED))
+    assert g.state == -1
+    assert g.overrides("human", 4) == (4, 1.0, True)
+    assert g.overrides("zombie", 4) == (5, 1.0, False)
+    g.update(np.array([OUTCOME_CAUGHT] * 5 + [OUTCOME_TRUNCATED] * 5))
+    assert g.state == 0 and not g.overrides("human", 4)[2]
+
+
+def test_lr_floor_stops_the_linear_decay():
+    from zai_rl.algos.common import scheduled_lr
+
+    for progress, frac in ((0.0, 1.0), (0.4, 0.6), (0.9, 0.5), (1.0, 0.5)):
+        assert scheduled_lr(3e-4, progress, 0.5) == pytest.approx(3e-4 * frac)
+    assert scheduled_lr(3e-4, 1.0) == 0.0, "no floor by default"
+    assert scheduled_lr(3e-4, 0.0, 0.5, 0.5) == pytest.approx(1.5e-4)
 
 
 def test_slots_never_switch_an_opponent_within_an_episode(tiny_cfg, tmp_path):
@@ -176,7 +198,7 @@ def test_tiny_league_trains_snapshots_and_resumes(tiny_cfg, tmp_path, monkeypatc
     state = torch.load(league_pt, weights_only=False)
     assert state["iteration"] == 3
     snaps = [e for e in state["pool"]["entries"]["zombie"] if e["source"] == "league"]
-    assert len(snaps) == 2, "one at the start, one after two iterations"
+    assert len(snaps) == 3, "at the start, after two iterations and at the end of the budget"
     assert (tmp_path / "data" / "leagues" / "lg" / "pool.json").is_file()
     assert (tmp_path / "data" / "models" / "lg-human.onnx").is_file()
     # Resume for one more iteration: the pool state carries over.
@@ -194,7 +216,13 @@ def test_tiny_league_trains_snapshots_and_resumes(tiny_cfg, tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize(
-    "name", ["league_cpu.yaml", "league_s0small_gpu.yaml", "league_m6_gpu.yaml"]
+    "name",
+    [
+        "league_cpu.yaml",
+        "league_s0small_gpu.yaml",
+        "league_s0small_short3_gpu.yaml",
+        "league_m6_gpu.yaml",
+    ],
 )
 def test_league_configs_load(name):
     from zai_env.config import config_dir as env_dir

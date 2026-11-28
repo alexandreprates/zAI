@@ -1,0 +1,19 @@
+# s0_small plus the zombie surround potential (docs/ARCHITECTURE.md section 4.8.9, short3).
+# A separate file so the distill, M5 and 4.7 configs that use s0_small.yaml stay unchanged.
+# Kept in sync with s0_small.yaml by hand (configs are merged over the defaults only).
+map_size_m: 75.0
+house_count: 3
+zombie_count: 3
+food_count: 50
+food_near_spawn_count: 3
+food_near_spawn_radius_m: 15.0
+episode_cap_s: 300.0
+min_spawn_distance_m: 25.0
+reward:
+  human_food_shaping: 1.0
+  zombie_distance_shaping: 0.5
+  zombie_step_penalty: 0.0
+  # Team surround potential k * (W - |sum w_i u_i|) / max(W, 2), w_i = 1 - min(d_i, 30) / 30
+  # (see Env::surround_potential).
+  zombie_surround_shaping: 0.25
+  zombie_surround_range_m: 30.0

@@ -1,0 +1,53 @@
+# Third short GPU league (docs/ARCHITECTURE.md section 4.8.9): league_s0small_gpu.yaml plus the
+# changes for league-s0small-short3: zombie lr floor, freezing guard and the zombie surround
+# potential (configs/env/s0_small_surround.yaml). Run with --total-steps 40000000.
+env_config: configs/env/s0_small_surround.yaml
+stage: s0_small
+zombie_counts: [3, 6, 9]
+num_envs: 1024
+total_steps: 300000000
+seed: 0
+num_threads: 20
+torch_threads: 4
+device: cuda
+human_init: /checkpoints/human/human-s0small-distill/final.pt
+zombie_init: /checkpoints/zombie/zombie-s0small-crowd-distill/final.pt
+seeds:
+  - {side: zombie, path: /checkpoints/zombie/zombie-s0small-m5-distill/final.pt, id: zombie-m5}
+  - {side: human, path: /checkpoints/human/human-s0-m4-distill/final.pt, id: human-m4}
+eval_every: 20
+eval_episodes: 128
+checkpoint_every: 20
+league:
+  shares: [0.5, 0.25, 0.25]
+  slots: 4
+  scripted_share: 0.2
+  lease_iters: 5
+  snapshot_every_steps: 10000000
+  pfsp: hard
+  # Engage the imbalance guard earlier than the defaults (short run league-s0small-short1:
+  # s_z fell to 0.15 without the guard engaging).
+  guard_low: 0.3
+  guard_high: 0.7
+  guard_windows: 2
+  guard_release: [0.35, 0.65]
+  guard_mode: freeze  # skip the winning side's update while the guard is engaged
+human:
+  rollout: 128
+  bptt: 64
+  epochs: 4
+  minibatches: 8
+  lr: 0.0001
+  ent_start: 0.005
+  ent_end: 0.001
+  hidden: 256
+zombie:
+  rollout: 128
+  bptt: 64
+  epochs: 4
+  minibatches: 8
+  lr: 0.0003
+  lr_floor: 0.5  # never below 1.5e-4 (short2: ~2e-5 over the last 10 M steps)
+  ent_start: 0.005
+  ent_end: 0.001
+  hidden: 128

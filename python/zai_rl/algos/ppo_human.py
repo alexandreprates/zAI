@@ -25,6 +25,7 @@ from .common import (
     gae,
     require_obs_version,
     save_checkpoint,
+    scheduled_lr,
 )
 
 __all__ = [
@@ -46,6 +47,8 @@ class PPOConfig:
     epochs: int = 4
     minibatches: int = 8
     lr: float = 3e-4
+    # The linear lr decay stops at this fraction of `lr` (0: decays to 0).
+    lr_floor: float = 0.0
     gamma: float = 0.995
     gae_lambda: float = 0.95
     clip: float = 0.2
@@ -113,7 +116,7 @@ class HumanPPO:
         T, E = rollout["rewards"].shape
         L = cfg.bptt
         chunks = T // L
-        lr = cfg.lr * max(0.0, 1.0 - progress) * lr_scale
+        lr = scheduled_lr(cfg.lr, progress, cfg.lr_floor, lr_scale)
         for g in self.optimizer.param_groups:
             g["lr"] = lr
         ent_coef = cfg.ent_start + (cfg.ent_end - cfg.ent_start) * min(1.0, progress)
